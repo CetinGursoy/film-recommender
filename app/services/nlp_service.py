@@ -9,6 +9,7 @@ import numpy as np
 _model = None
 _movie_embeddings = {}  # {movie_id: vector}
 _movie_metadata = {}    # {movie_id: {title, poster}}
+_popular_people = set() # Cache for actor/director names
 
 # 🔥 MULTILINGUAL MODEL (Türkçe için çok daha iyi)
 MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
@@ -37,12 +38,13 @@ def generate_embeddings_for_db(movies):
                 data = pickle.load(f)
                 _movie_embeddings = data.get("embeddings", {})
                 _movie_metadata = data.get("metadata", {})
-                print(f"✅ {_len(_movie_embeddings)} film önbellekten yüklendi!")
+                _popular_people = data.get("popular_people", set())
+                print(f"✅ {_len(_movie_embeddings)} film ve {_len(_popular_people)} kişi önbellekten yüklendi!")
                 
                 # Check if we need to update (simple check: count)
-                if len(_movie_embeddings) >= len(movies):
+                if len(_movie_embeddings) >= len(movies) and _popular_people:
                     return
-                print("⚠ Yeni filmler var, tekrar hazırlanıyor...")
+                print("⚠ Yeni filmler var veya kişi listesi eksik, tekrar hazırlanıyor...")
         except Exception as e:
             print(f"❌ Önbellek okuma hatası: {e}")
 
@@ -73,6 +75,10 @@ def generate_embeddings_for_db(movies):
                 if isinstance(cast_data, list):
                     names = [p.get("name", "") for p in cast_data if p.get("name")]
                     cast_str = ", ".join(names[:5]) # Top 5 actors
+                    
+                    # Collect Popular People (Top 10)
+                    for p in cast_data[:10]:
+                        if p.get("name"): _popular_people.add(p["name"])
         except:
             cast_str = str(m.cast)
 
@@ -83,6 +89,10 @@ def generate_embeddings_for_db(movies):
                 if isinstance(dir_data, list):
                     names = [d.get("name", "") for d in dir_data if d.get("name")]
                     director_str = ", ".join(names)
+                    
+                    # Collect Directors
+                    for d in names:
+                        _popular_people.add(d)
         except:
              director_str = str(m.directors)
 
@@ -116,7 +126,8 @@ def generate_embeddings_for_db(movies):
             with open(EMBEDDING_FILE, "wb") as f:
                 pickle.dump({
                     "embeddings": _movie_embeddings,
-                    "metadata": _movie_metadata
+                    "metadata": _movie_metadata,
+                    "popular_people": _popular_people
                 }, f)
             print("💾 Embeddingler diske kaydedildi.")
         except Exception as e:
@@ -126,6 +137,10 @@ def generate_embeddings_for_db(movies):
 
 def _len(d):
     return len(d) if d else 0
+
+def get_popular_people():
+    global _popular_people
+    return _popular_people
 
 def semantic_search(query, top_k=3, score_threshold=0.5):
     """
@@ -137,7 +152,8 @@ def semantic_search(query, top_k=3, score_threshold=0.5):
         top_k: Maximum number of results
         score_threshold: Minimum cosine similarity score (0-1). Default 0.5
     """
-    global _movie_embeddings, _movie_metadata
+
+    global _movie_embeddings, _movie_metadata, _model
     
     model = load_model()
     
@@ -190,6 +206,7 @@ def hybrid_search(query, top_k=5, score_threshold=0.35):
         score_threshold: Minimum semantic similarity score
     """
     import math
+    from difflib import SequenceMatcher
     global _movie_metadata
     
     # 1. Semantic sonuçları al (geniş havuz, düşük eşik)
@@ -211,8 +228,23 @@ def hybrid_search(query, top_k=5, score_threshold=0.35):
         # Quality boost: 60% IMDb weight, 40% popularity weight
         quality_boost = (vote_normalized * 0.6) + (pop_normalized * 0.4)
         
-        # Hibrit skor: semantic * (1 + quality_boost)
-        r["hybrid_score"] = r["score"] * (1 + quality_boost)
+        # EXACT MATCH BOOST
+        # Eğer sorgu = film başlığı ise (veya çok yakınsa), puanı uçur.
+        title_lower = meta.get("title", "").lower()
+        query_lower = query.lower()
+        
+        match_ratio = SequenceMatcher(None, query_lower, title_lower).ratio()
+        
+        title_boost = 0
+        if match_ratio > 0.9: # Neredeyse aynı (%90+)
+            title_boost = 3.0 # semantic score (genelde 0-1 arası) yanında devasa bir boost
+        elif match_ratio > 0.7: # Benziyor
+             title_boost = 0.5
+        elif query_lower in title_lower: # İçinde geçiyor
+             title_boost = 0.2
+
+        # Hibrit skor: semantic * (1 + quality_boost) + title_boost
+        r["hybrid_score"] = (r["score"] * (1 + quality_boost)) + title_boost
     
     # 3. Hibrit skora göre sırala
     raw_results.sort(key=lambda x: x["hybrid_score"], reverse=True)

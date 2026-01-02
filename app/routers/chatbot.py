@@ -24,26 +24,13 @@ def load_embeddings():
     generate_embeddings_for_db(movies)
     
     # Cache Popular People for Fuzzy Search
+    # Updated optimize logic:
+    from app.services.nlp_service import get_popular_people
+    
     global POPULAR_PEOPLE
-    POPULAR_PEOPLE = set()
-    # Simplified: Get all actors from top 500 movies?
-    # Or just iterate all and collect unique names (might be heavy?)
-    # Let's verify execution time. 1600 movies is fine.
-    import json
-    for m in movies:
-        try:
-             cast = json.loads(m.cast) if isinstance(m.cast, str) else m.cast
-             if cast:
-                 for p in cast[:10]: # Top 10 actors per movie (expanded from 3)
-                     if p.get("name"): POPULAR_PEOPLE.add(p["name"])
-             
-             dirs = json.loads(m.directors) if isinstance(m.directors, str) else m.directors
-             if dirs:
-                 for d in dirs:
-                     if d.get("name"): POPULAR_PEOPLE.add(d["name"])
-        except:
-             pass
-    print(f"🧶 Fuzzy Search için {len(POPULAR_PEOPLE)} kişi hafızaya alındı.")
+    POPULAR_PEOPLE = get_popular_people()
+    
+    print(f"🧶 Fuzzy Search için {len(POPULAR_PEOPLE)} kişi hafızaya alındı (Cache).")
     
     db.close()
 
@@ -57,6 +44,14 @@ async def ask_chatbot(
     if not text:
         return {"reply": "...", "action": "none"}
     
+    # 0. GİRDİ UZUNLUĞU VE ANLAMSIZLIK KONTROLÜ
+    if len(text) < 3:
+        return {"reply": "Anlayamadım, biraz daha detay verebilir misin?", "action": "none"}
+
+    # Eğer girdi çok uzun ama içinde boşluk yoksa (rastgele harf dizisi)
+    if len(text) > 15 and " " not in text:
+        return {"reply": "Girdiğin metni tam anlayamadım. Film ismi veya tür mü yazmıştın?", "action": "none"}
+    
     text_lower = text.lower()
 
     if not is_clean(text_lower):
@@ -66,8 +61,11 @@ async def ask_chatbot(
         }
 
     # 1. SOHBET / CHITTER CHATTER
-    greetings = ["merhaba", "selam", "hi", "hello", "naber", "günaydın", "iyi akşamlar", "selamlar"]
-    if any(x in text_lower for x in greetings):
+    greetings = ["merhaba", "selam", "hi", "hello", "naber", "günaydın", "iyi akşamlar", "selamlar", "mrb", "slm"]
+    
+    # Fuzzy Match for Greetings (Yazım hatası toleransı: örn 'meraba')
+    best_greet = process.extractOne(text_lower, greetings)
+    if best_greet and best_greet[1] >= 80:
         return {
             "reply": "Merhaba! Ben FilmRec asistanıyım. Sana film önerebilir, teknik destek verebilir veya hesabınla ilgili yardımcı olabilirim. Ne istersin?",
             "action": "none"
@@ -181,6 +179,19 @@ async def ask_chatbot(
         is_negative = any(nk in context_str for nk in negative_keywords)
         return is_negative
 
+    # Yardımcı: Bir kişi ismi metinde geçiyor mu ve negatif mi?
+    def analyze_person_intent(text, person_name):
+        idx = text.find(person_name)
+        if idx == -1: return False
+        
+        # Context window
+        start = max(0, idx - 15) # Biraz daha geniş geriye bak
+        end = min(len(text), idx + len(person_name) + 25)
+        context_str = text[start:end]
+        
+        is_negative = any(nk in context_str for nk in negative_keywords)
+        return is_negative
+
     # 2.1 Exact Match Check
     for k, v in genres_map.items():
         if k in text_lower:
@@ -231,8 +242,11 @@ async def ask_chatbot(
     # Logic Update: It is a genre query if we have POSITIVE genres OR NEGATIVE genres
     if unique_genre_values or excluded_genres:
         # Check noise...
+        turkish_keywords = ["türk", "yerli", "türkçe"]
+        is_turkish_intent = any(k in text_lower for k in turkish_keywords)
+        
         noise = ["filmleri", "filmi", "film", "öner", "listele", "aç", "getir", "var", "mı", "boşluk", "bana", "ve", "ile", "daha", "yenileri", "olan"] 
-        all_noise = noise + new_intent_keywords + negative_keywords # Add negative keywords to noise
+        all_noise = noise + new_intent_keywords + negative_keywords + turkish_keywords # Add keywords to noise
         
         clean_t = text_lower
         for k, v in found_genres: clean_t = clean_t.replace(k, "")
@@ -262,6 +276,10 @@ async def ask_chatbot(
             
         # 2. QUERY
         query_base = db.query(Movie)
+        
+        # Turkish Filter
+        if is_turkish_intent:
+            query_base = query_base.filter(Movie.original_language == 'tr')
         
         # Positive Filters
         for g_val in unique_genre_values:
@@ -483,7 +501,7 @@ async def ask_chatbot(
     
     if has_theme_keyword:
         print(f"🎬 Theme keyword detected, triggering semantic search: {text}")
-        semantic_results = hybrid_search(text, top_k=5, score_threshold=0.35)
+        semantic_results = hybrid_search(text, top_k=5, score_threshold=0.45)
         if semantic_results:
             return {
                 "reply": "Aradığın konuya uygun şunları buldum:",
@@ -534,30 +552,42 @@ async def ask_chatbot(
         if session_id and session_id in SESSION_MEMORY and is_continuation:
              exclude_ids = SESSION_MEMORY[session_id].get("recommended_ids", set())
 
-        # ATTEMPT 0: Direct (raw)
-        people_res = search_people(text_lower if not is_continuation else person_query, exclude_ids)
-        
-        # ATTEMPT 1: Cleaned
-        if not people_res and person_query != text_lower:
-            people_res = search_people(person_query, exclude_ids)
-        
-        # ATTEMPT 2: Split by Apostrophe
-        if not people_res and "'" in person_query:
-            cleaned = person_query.split("'")[0].strip()
-            people_res = search_people(cleaned, exclude_ids)
-
-        # ATTEMPT 3: Iterative Suffix Stripping
-        if not people_res:
-            cleaned = person_query
-            for s in suffixes:
-                if cleaned.endswith(s):
-                    # Remove suffix
-                    candidate = cleaned[:-len(s)].strip()
-                    if len(candidate) > 2:
-                          people_res = search_people(candidate, exclude_ids)
-                          if people_res: 
-                              search_query = candidate # Update query for display
-                              break 
+        # NEGATIVE INTENT CHECK (NEW)
+        # Check if the extracted "person_query" is mentioned negatively in the FULL text
+        # e.g. "Cem Yılmaz olmasın" -> person_query="cem yılmaz", intent=Negative
+        is_negative_person = analyze_person_intent(text_lower, person_query)
+        if is_negative_person:
+             print(f"🚫 Negative Person Intent Detected: {person_query}. Skipping People Search.")
+             people_res = [] # Skip search
+        else:
+             # ATTEMPT 0: Direct (raw)
+             people_res = search_people(text_lower if not is_continuation else person_query, exclude_ids)
+             
+             # ATTEMPT 1: Cleaned
+             if not people_res and person_query != text_lower:
+                 people_res = search_people(person_query, exclude_ids)
+                 
+             # ATTEMPT 2: Split by Apostrophe
+             if not people_res and "'" in person_query:
+                 cleaned = person_query.split("'")[0].strip()
+                 people_res = search_people(cleaned, exclude_ids)
+    
+             # ATTEMPT 3: Iterative Suffix Stripping
+             if not people_res:
+                 cleaned = person_query
+                 for s in suffixes:
+                     if cleaned.endswith(s):
+                         # Remove suffix
+                         candidate = cleaned[:-len(s)].strip()
+                         # Check negative intent on candidate too?
+                         if len(candidate) > 2:
+                               if not analyze_person_intent(text_lower, candidate):
+                                   people_res = search_people(candidate, exclude_ids)
+                                   if people_res: 
+                                       search_query = candidate 
+                                       break
+                               else:
+                                   print(f"🚫 Negative Person Intent on Suffix Candidate: {candidate}") 
 
         # ATTEMPT 4: Fuzzy Search (TheFuzz)
         if not people_res:
@@ -573,9 +603,13 @@ async def ask_chatbot(
                  if match:
                      best_name, score = match
                      if score >= 85: # High confidence for names
-                         print(f"🧶 Fuzzy Person Match: '{person_query}' -> '{best_name}' ({score}%)")
-                         people_res = search_people(best_name, exclude_ids)
-                         search_query = best_name # Update for display 
+                         # Check negation for fuzzy match name
+                         if analyze_person_intent(text_lower, best_name) or analyze_person_intent(text_lower, person_query):
+                             print(f"🚫 Negative Person Intent on Fuzzy Match: {best_name}")
+                         else:
+                             print(f"🧶 Fuzzy Person Match: '{person_query}' -> '{best_name}' ({score}%)")
+                             people_res = search_people(best_name, exclude_ids)
+                             search_query = best_name # Update for display 
 
         # FINAL CHECK: If continuation but no results found (maybe all exhausted?)
         if not people_res and is_continuation and last_person_query and exclude_ids:
@@ -821,17 +855,28 @@ async def ask_chatbot(
         "hayal", "rüya", "fantezi", "büyü", "sihir",
         "yapay zeka", "robot", "teknoloji", "hacker",
         "kaçış", "hapishane", "mahkum",
-        "aile", "çocuk", "ebeveyn", "çocukluk"
+        "aile", "çocuk", "ebeveyn", "çocukluk",
+        # New Additions for Mood/Abstract
+        "umut", "samimi", "içten", "dokunaklı", "etkileyici", "ağla", "psikolojik", "derin", "felsefi",
+        "hayat", "yaşam", "biyografi", "gerçek", "sanat", "ödüllü"
     ]
     
-    is_semantic_likely = len(text.split()) > 2 or any(x in text_lower for x in theme_keywords)
+    is_semantic_likely = len(text.split()) > 3 or any(kw in text_lower for kw in theme_keywords)
     
-    if is_semantic_likely and not found_genres:  # Don't override if genre was detected
+    # Logic Update: Allow semantic search even if genre found IF query is complex/thematic
+    # e.g. "Ağlatan dram filmi" -> Genre: Drama, Theme: Sad -> Should trigger Semantic
+    should_run_semantic = is_semantic_likely
+    
+    if found_genres and len(text.split()) < 4 and not any(kw in text_lower for kw in theme_keywords):
+        # Only simple genre queries (e.g. "Komedi filmleri") should skip semantic
+        should_run_semantic = False
+
+    if should_run_semantic:
         print(f"🧠 Semantic/Theme Search Triggered for: {text}")
-        semantic_results = hybrid_search(text, top_k=5, score_threshold=0.4) # Lower threshold for themes
+        semantic_results = hybrid_search(text, top_k=5, score_threshold=0.4) # Lower threshold for themes (0.4)
         if semantic_results:
              return {
-                "reply": "Aradığın konuya uygun şunları buldum:",
+                "reply": "Aradığın duyguya veya konuya göre şunları buldum:",
                 "movies": semantic_results
             }
 
@@ -956,7 +1001,7 @@ async def ask_chatbot(
 
     # 7. GENERIC FALLBACK TO SEMANTIC
     # If nothing else worked, try semantic logic one last time with the raw text
-    fallback_semantic = hybrid_search(text, top_k=3)
+    fallback_semantic = hybrid_search(text, top_k=3, score_threshold=0.45)
     if fallback_semantic:
          return {
             "reply": "Tam anlayamadım ama belki şunlar ilgini çeker:",
@@ -984,12 +1029,19 @@ async def ask_chatbot(
             }
     
     # 9. ABSOLUTE FALLBACK - Suggest popular if nothing matched
-    popular_fallback = db.query(Movie).order_by(Movie.popularity.desc()).limit(3).all()
-    if popular_fallback:
-        return {
-            "reply": "Aradığını bulamadım, ama en popüler filmlere göz atabilirsin:",
-            "movies": [{"id": m.id, "title": m.title, "poster": m.poster_url or m.poster_path} for m in popular_fallback]
-        }
+    # Sadece harf değil, gerçek bir kelimeyse popülerleri öner
+    if len(search_query) > 3:
+        popular_fallback = db.query(Movie).order_by(Movie.popularity.desc()).limit(3).all()
+        if popular_fallback:
+            return {
+                "reply": "Aradığını bulamadım, ama en popüler filmlere göz atabilirsin:",
+                "movies": [{"id": m.id, "title": m.title, "poster": m.poster_url or m.poster_path} for m in popular_fallback]
+            }
+    
+    return {
+        "reply": "Bunu tam anlayamadım. 'Komedi filmleri' gibi bir arama yapabilirsin.",
+        "action": "none"
+    }
 
     return {
         "reply": "Bunu tam anlayamadım. 'Komedi filmleri', 'Cem Yılmaz', 'Ağlatan filmler' gibi aramalar yapabilirsin.",
