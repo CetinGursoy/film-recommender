@@ -100,7 +100,9 @@ def generate_embeddings_for_db(movies):
         
         _movie_metadata[m.id] = {
             "title": m.title,
-            "poster": m.poster_url or m.poster_path
+            "poster": m.poster_url or m.poster_path,
+            "vote_average": m.vote_average or 0,
+            "popularity": m.popularity or 0
         }
 
     if texts:
@@ -175,3 +177,47 @@ def semantic_search(query, top_k=3, score_threshold=0.5):
             })
             
     return results
+
+
+def hybrid_search(query, top_k=5, score_threshold=0.35):
+    """
+    Semantic search + Popülerlik/Kalite skorlaması.
+    Hibrit skor = semantic_score * (1 + quality_boost)
+    
+    Args:
+        query: Search query text
+        top_k: Maximum number of results
+        score_threshold: Minimum semantic similarity score
+    """
+    import math
+    global _movie_metadata
+    
+    # 1. Semantic sonuçları al (geniş havuz, düşük eşik)
+    raw_results = semantic_search(query, top_k=50, score_threshold=0.3)
+    
+    if not raw_results:
+        return []
+    
+    # 2. Her sonuç için hibrit skor hesapla
+    for r in raw_results:
+        meta = _movie_metadata.get(r["id"], {})
+        vote = meta.get("vote_average", 5)
+        pop = meta.get("popularity", 10)
+        
+        # Normalize: vote 0-10 -> 0-1, pop log scale -> 0-1
+        pop_normalized = min(math.log10(pop + 1) / 3, 1)  # Log scale, max ~1
+        vote_normalized = vote / 10                        # 0-1
+        
+        # Quality boost: 60% IMDb weight, 40% popularity weight
+        quality_boost = (vote_normalized * 0.6) + (pop_normalized * 0.4)
+        
+        # Hibrit skor: semantic * (1 + quality_boost)
+        r["hybrid_score"] = r["score"] * (1 + quality_boost)
+    
+    # 3. Hibrit skora göre sırala
+    raw_results.sort(key=lambda x: x["hybrid_score"], reverse=True)
+    
+    # 4. Eşik üstündekileri döndür
+    filtered = [r for r in raw_results if r["score"] >= score_threshold]
+    
+    return filtered[:top_k]

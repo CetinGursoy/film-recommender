@@ -71,3 +71,107 @@ def recommend_personal(db: Session, user_id: int, limit=5):
             break
             
     return final_movies
+
+
+def recommend_by_genre(db: Session, user_id: int, exclude_ids: list = None, limit: int = 5):
+    """
+    Beğenilen filmlerin türlerine göre benzer filmler öner.
+    Her seferinde farklı filmler önermek için exclude_ids kullanılır.
+    """
+    if exclude_ids is None:
+        exclude_ids = []
+    
+    # 1. Kullanıcının beğendiği filmler
+    likes = db.query(Like).filter(Like.user_id == user_id).all()
+    if not likes:
+        return [], []  # movies, genre_names
+    
+    liked_movie_ids = {l.movie_id for l in likes}
+    liked_movies = db.query(Movie).filter(Movie.id.in_(liked_movie_ids)).all()
+    
+    # 2. En çok beğenilen türleri bul
+    genre_counts = {}
+    for m in liked_movies:
+        try:
+            genres = json.loads(m.genres) if m.genres else []
+            for g in genres:
+                name = g['name'] if isinstance(g, dict) else str(g)
+                genre_counts[name] = genre_counts.get(name, 0) + 1
+        except:
+            continue
+    
+    if not genre_counts:
+        return [], []
+    
+    # En popüler 3 tür (Kullanıcı isteği: Top 3)
+    sorted_genres = sorted(genre_counts.items(), key=lambda x: x[1], reverse=True)
+    top_genres = [g[0] for g in sorted_genres[:3]]
+    
+    # 3. Bu türlerdeki filmleri bul (beğenilmemiş ve exclude edilmemiş)
+    all_exclude = liked_movie_ids.union(set(exclude_ids))
+    
+    # Genre filter - en az bir türe uyan filmler
+    from sqlalchemy import or_
+    genre_filters = [Movie.genres.like(f"%{g}%") for g in top_genres]
+    
+    recommended = (db.query(Movie)
+                   .filter(or_(*genre_filters))
+                   .filter(~Movie.id.in_(all_exclude))
+                   .order_by(Movie.popularity.desc())
+                   .limit(limit)
+                   .all())
+    
+    return recommended, top_genres
+
+
+def recommend_by_actor(db: Session, user_id: int, exclude_ids: list = None, limit: int = 5):
+    """
+    Beğenilen filmlerdeki oyuncuların diğer filmlerini öner.
+    Her seferinde farklı filmler önermek için exclude_ids kullanılır.
+    """
+    if exclude_ids is None:
+        exclude_ids = []
+    
+    # 1. Kullanıcının beğendiği filmler
+    likes = db.query(Like).filter(Like.user_id == user_id).all()
+    if not likes:
+        return [], []  # movies, actor_names
+    
+    liked_movie_ids = {l.movie_id for l in likes}
+    liked_movies = db.query(Movie).filter(Movie.id.in_(liked_movie_ids)).all()
+    
+    # 2. En çok görülen oyuncuları bul
+    actor_counts = {}
+    for m in liked_movies:
+        try:
+            cast = json.loads(m.cast) if isinstance(m.cast, str) else m.cast
+            if cast:
+                for actor in cast[:5]:  # Her filmden ilk 5 oyuncu
+                    name = actor.get("name") if isinstance(actor, dict) else str(actor)
+                    if name:
+                        actor_counts[name] = actor_counts.get(name, 0) + 1
+        except:
+            continue
+    
+    if not actor_counts:
+        return [], []
+    
+    # En popüler 3 oyuncu (Kullanıcı isteği: Top 3)
+    sorted_actors = sorted(actor_counts.items(), key=lambda x: x[1], reverse=True)
+    top_actors = [a[0] for a in sorted_actors[:3]]
+    
+    # 3. Bu oyuncuların filmlerini bul
+    all_exclude = liked_movie_ids.union(set(exclude_ids))
+    
+    from sqlalchemy import or_
+    actor_filters = [Movie.cast.like(f"%{a}%") for a in top_actors]
+    
+    recommended = (db.query(Movie)
+                   .filter(or_(*actor_filters))
+                   .filter(~Movie.id.in_(all_exclude))
+                   .order_by(Movie.popularity.desc())
+                   .limit(limit)
+                   .all())
+    
+    return recommended, top_actors
+

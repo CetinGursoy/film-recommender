@@ -239,7 +239,19 @@ def search(query: str, db: Session = Depends(get_db)):
         
         return list(variants)
 
-    # Varyasyonları üret
+    # 0. SIMPLE ATTEMPT (Direct Match) for robustness
+    simple_movies = db.query(Movie).filter(
+        or_(
+            Movie.title.ilike(f"%{query}%"),
+            Movie.cast.ilike(f"%{query}%"),
+            Movie.directors.ilike(f"%{query}%")
+        )
+    ).limit(50).all()
+    
+    if simple_movies:
+        return [convert(m) for m in simple_movies]
+
+    # Varyasyonları üret (Fallback)
     search_variants = generate_search_variants(query)
 
     filters = []

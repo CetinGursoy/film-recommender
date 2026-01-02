@@ -250,7 +250,7 @@ export default function Home() {
             <button className="filter-pill" onClick={() => filterCategory("bilim")}>Bilim Kurgu</button>
             <button className="filter-pill" onClick={() => filterCategory("korku")}>Korku</button>
             <button className="filter-pill" onClick={() => filterCategory("turk")}>Türk Filmleri</button>
-            <button className="filter-pill" onClick={() => filterCategory("imdb85")}>IMDb 8.5+</button>
+
             <button className="filter-pill" onClick={() => filterCategory("dram")}>Dram</button>
             <button className="filter-pill" onClick={() => filterCategory("komedi")}>Komedi</button>
             <button className="filter-pill" onClick={() => filterCategory("romantik")}>Romantik</button>

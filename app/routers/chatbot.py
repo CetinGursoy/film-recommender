@@ -7,7 +7,7 @@ from app.services.nlp_filter import is_clean
 from app.services.recommendation import recommend_personal
 from app.models.movie import Movie
 from sqlalchemy import or_
-from app.services.nlp_service import generate_embeddings_for_db, semantic_search
+from app.services.nlp_service import generate_embeddings_for_db, semantic_search, hybrid_search
 from app.db import SessionLocal
 from thefuzz import process
 
@@ -34,7 +34,7 @@ def load_embeddings():
         try:
              cast = json.loads(m.cast) if isinstance(m.cast, str) else m.cast
              if cast:
-                 for p in cast[:3]: # Top 3 actors per movie
+                 for p in cast[:10]: # Top 10 actors per movie (expanded from 3)
                      if p.get("name"): POPULAR_PEOPLE.add(p["name"])
              
              dirs = json.loads(m.directors) if isinstance(m.directors, str) else m.directors
@@ -135,6 +135,13 @@ async def ask_chatbot(
         SESSION_MEMORY = {}
 
     session_id = msg.get("session_id")
+    
+    # 🌟 ENHANCEMENT: Use User ID for persistence if logged in
+    # This ensures "Bana Film Öner" rotation works even if frontend refreshes session_id
+    if current_user:
+        session_id = f"user_{current_user.id}"
+        print(f"🔐 Authenticated User detected. Using ID-based session: {session_id}")
+
     context = SESSION_MEMORY.get(session_id, {}) if session_id else {}
 
     # Keywords for "Refinement / Continuation"
@@ -152,45 +159,65 @@ async def ask_chatbot(
         # If user says "Peki aksiyon?", override genre
         # We let standard detection run first, if it finds a new genre, it overrides.
         
-    # 2. GENRE DETECTION (Multi-Genre Support with Fuzzy)
-    found_genres = set()
+    # 2. GENRE DETECTION (Positive & Negative)
+    found_genres = set()     # (name, db_value)
+    excluded_genres = set()  # db_value only
     
-    # 2.1 Exact Match First
+    negative_keywords = ["olmasın", "istemiyorum", "hariç", "sevmem", "nefret", "değil", "yok"]
+    
+    # Yardımcı: Bir genre metinde geçiyor mu ve negatif mi?
+    def analyze_genre_intent(text, genre_name, genre_val):
+        idx = text.find(genre_name)
+        if idx == -1: return False
+        
+        # Kelime sınırlarını kontrol et (optional but good)
+        # Şimdilik basit context check
+        
+        # Context window: 5 chars before, 25 chars after
+        start = max(0, idx - 10)
+        end = min(len(text), idx + len(genre_name) + 25)
+        context_str = text[start:end]
+        
+        is_negative = any(nk in context_str for nk in negative_keywords)
+        return is_negative
+
+    # 2.1 Exact Match Check
     for k, v in genres_map.items():
         if k in text_lower:
-            found_genres.add((k, v))
+            if analyze_genre_intent(text_lower, k, v):
+                excluded_genres.add(v)
+                print(f"🚫 Negative Genre Detected: {k}")
+            else:
+                found_genres.add((k, v))
             
-    # 2.2 Fuzzy Match (if no exact found)
-    # Tokenize input and check against genre keys
-    # Only if exact detection failed or just to augment? 
-    # Let's augment but be strict (80%)
+    # 2.2 Fuzzy Match (if needed - skipping logic for simplicity or can adapt)
+    # ... (Keep existing fuzzy logic but add negation check if you want, usually exact covers it)
     
+    # ... (Existing fuzzy loop logic - simplified for brevity in this replacement) ...
+     
     tokens = text_lower.split()
     genre_keys = list(genres_map.keys())
-    
     for t in tokens:
-        # Skip very short words to avoid false positives
         if len(t) < 4: continue
-        
-        # Don't fuzzy match if it's already an exact match in the text
         if any(k in t for k in genre_keys): continue
-
         match = process.extractOne(t, genre_keys)
         if match:
             best_match, score = match
             if score >= 80:
-                print(f"🧶 Fuzzy Genre Match: '{t}' -> '{best_match}' ({score}%)")
-                found_genres.add((best_match, genres_map[best_match]))
+                # Fuzzy match found, check negation on the TOKEN
+                # We use the token 't' match position approx or just the token context?
+                # It's safer to re-find the token in text.
+                if analyze_genre_intent(text_lower, t, genres_map[best_match]):
+                     excluded_genres.add(genres_map[best_match])
+                     print(f"🚫 Fuzzy Negative: {best_match}")
+                else:
+                     found_genres.add((best_match, genres_map[best_match]))
 
-    # If no genres found BUT we have context and it's a refinement/short query
-    if not found_genres and context.get("last_genres") and (is_refinement or len(text.split()) < 4):
+    # If no genres found BUT we have context... (Keep existing logic)
+    if not found_genres and not excluded_genres and context.get("last_genres") and (is_refinement or len(text.split()) < 4):
          # Restore last genres
-         print(f"🔄 Restoring context genres: {context['last_genres']}")
-         found_genres = set(tuple(x) for x in context['last_genres']) # Ensure tuples
+         found_genres = set(tuple(x) for x in context['last_genres'])
 
-
-    # ... Deduplication logic ...
-    
     unique_genre_values = set()
     display_genre_names = []
     
@@ -198,47 +225,86 @@ async def ask_chatbot(
         if v not in unique_genre_values:
             unique_genre_values.add(v)
             display_genre_names.append(k.capitalize())
-            
+
     is_pure_genre_query = False
     
-    if unique_genre_values:
-        # Check if query is "pure" (mostly just genre words + noise)
+    # Logic Update: It is a genre query if we have POSITIVE genres OR NEGATIVE genres
+    if unique_genre_values or excluded_genres:
+        # Check noise...
         noise = ["filmleri", "filmi", "film", "öner", "listele", "aç", "getir", "var", "mı", "boşluk", "bana", "ve", "ile", "daha", "yenileri", "olan"] 
-        all_noise = noise + new_intent_keywords
+        all_noise = noise + new_intent_keywords + negative_keywords # Add negative keywords to noise
         
         clean_t = text_lower
-        for k, v in found_genres:
-            clean_t = clean_t.replace(k, "") # Remove genre words
+        for k, v in found_genres: clean_t = clean_t.replace(k, "")
+        
+        # Remove excluded genre names too from text to check cleanliness
+        # We need to find the keys for excluded values? 
+        # Easier: Just replace known genre keys present in text
+        for k in genres_map:
+            if k in clean_t: clean_t = clean_t.replace(k, "")
             
         for n in all_noise:
             clean_t = clean_t.replace(n, "").strip() # Remove noise
             
-        # If nearly empty OR it was explicitly a context restoration
-        if len(clean_t) < 3 or (context.get("last_genres") and not is_refinement == False):
+        if len(clean_t) < 4 or (context.get("last_genres") and not is_refinement == False):
             is_pure_genre_query = True
 
-    if is_pure_genre_query and unique_genre_values:
-        # SAVE CONTEXT
+    if is_pure_genre_query and (unique_genre_values or excluded_genres):
+        # 1. SESSION MEMORY
         if session_id:
-            SESSION_MEMORY[session_id] = {
-                "last_genres": list(found_genres), # Save as list of tuples
-                "last_intent": "genre"
-            }
+            if session_id not in SESSION_MEMORY: SESSION_MEMORY[session_id] = {"recommended_ids": set()}
+            if "recommended_ids" not in SESSION_MEMORY[session_id]: SESSION_MEMORY[session_id]["recommended_ids"] = set()
             
+            # Update last genres only if positive ones found
+            if found_genres:
+                SESSION_MEMORY[session_id]["last_genres"] = list(found_genres)
+            SESSION_MEMORY[session_id]["last_intent"] = "genre"
+            
+        # 2. QUERY
         query_base = db.query(Movie)
         
-        # Apply AND logic for all found genres
+        # Positive Filters
         for g_val in unique_genre_values:
             query_base = query_base.filter(Movie.genres.like(f"%{g_val}%"))
-        
+            
+        # Negative Filters
+        for g_val in excluded_genres:
+            query_base = query_base.filter(~Movie.genres.like(f"%{g_val}%")) # NOT LIKE
+
+        # 3. EXCLUDE RECOMMENDED
+        if session_id:
+            excluded_ids = SESSION_MEMORY[session_id].get("recommended_ids", set())
+            if excluded_ids:
+                query_base = query_base.filter(Movie.id.not_in(excluded_ids))
+
+        # 4. SORTING
         if is_new_intent:
              movies = query_base.order_by(Movie.release_date.desc()).limit(5).all()
-             joined_names = " - ".join(display_genre_names)
-             reply_msg = f"İşte senin için en yeni {joined_names} filmleri:"
+             joined_names = " - ".join(display_genre_names) if display_genre_names else "Genel"
+             reply_msg = f"İşte senin için en yeni {joined_names} filmleri"
         else:
              movies = query_base.order_by(Movie.vote_average.desc()).limit(5).all()
-             joined_names = " - ".join(display_genre_names)
-             reply_msg = f"İşte senin için en iyi {joined_names} filmleri (Bağlam: {joined_names}):"
+             joined_names = " - ".join(display_genre_names) if display_genre_names else "Önerilen"
+             
+             if not movies and session_id:
+                 # Reset and retry
+                 SESSION_MEMORY[session_id]["recommended_ids"] = set()
+                 # Retry query
+                 query_base_retry = db.query(Movie)
+                 for g_val in unique_genre_values: query_base_retry = query_base_retry.filter(Movie.genres.like(f"%{g_val}%"))
+                 for g_val in excluded_genres: query_base_retry = query_base_retry.filter(~Movie.genres.like(f"%{g_val}%"))
+                 movies = query_base_retry.order_by(Movie.vote_average.desc()).limit(5).all()
+                 reply_msg = f"Tüm seçenekleri gösterdim! İşte tekrar:"
+             else:
+                 reply_msg = f"İşte {joined_names} filmleri:"
+
+        if excluded_genres:
+             reply_msg += " (İstemediğin türleri çıkardım 🚫)"
+
+        # 5. SAVE IDs
+        if session_id and movies:
+            current_ids = {m.id for m in movies}
+            SESSION_MEMORY[session_id]["recommended_ids"].update(current_ids)
 
         return {
             "reply": reply_msg,
@@ -263,53 +329,39 @@ async def ask_chatbot(
         # 1. Tokenize
         tokens = query.split()
         cleaned_tokens = []
-        
         for t in tokens:
-            # 2. Strict Stopword Check
+            # 3. Stopword removal
             if t in stopwords: continue
             
-            # 3. Fuzzy Stopword Check (Basic - if it looks like 'filmi' etc)
-            # Simple length check to avoid destroying short words
-            if len(t) > 3:
-                is_stop = False
-                for sw in stopwords:
-                    if len(sw) > 3 and sw in t: # Substring check (lazy fuzzy)
-                        # "filmii" contains "film"
-                         pass 
-                
-            # 4. Suffix Stripping (Per Token)
-            # Try to strip suffix if it makes the word a valid name part?
-            # Or just strip generally.
+            # 4. Suffix stripping (basic for Turkish names handling)
+            # "tarantino'nun" -> "tarantino"
+            suffixes = ["nın", "nin", "nun", "nün", "in", "ın", "un", "ün", "yi", "yı", "yu", "yü", "ye", "ya", "den", "dan", "ten", "tan"]
             candidate = t
             for s in suffixes:
-                if candidate.endswith(s):
-                    # Check if stripping leaves enough chars
-                    stripped = candidate[:-len(s)]
-                    if len(stripped) >= 3: # "Cem" is 3 chars. "Ali" is 3. 
-                        candidate = stripped
-                        break # Strip only longest match
+                if t.endswith(s) and len(t) > len(s) + 2: 
+                    candidate = t[:-len(s)]
+                    break
             
             cleaned_tokens.append(candidate)
             
         return " ".join(cleaned_tokens).strip()
 
     search_query = clean_tokens(text_lower)
+    print(f"🕵️ CHATBOT DEBUG: text_lower='{text_lower}' -> clean_tokens='{search_query}'")
     
     import json
     from sqlalchemy import or_
 
-    def generate_search_variants(q):
-        variants = {q}
-        
-        # 1. Turkish Character Map (For Anglicization)
-        # i -> i works for anglicization
-        tr_map = {"ı": "i", "ğ": "g", "ü": "u", "ş": "s", "ö": "o", "ç": "c", "İ": "I", "I": "i"}
-        anglicized = "".join(tr_map.get(c, c) for c in q)
-        variants.add(anglicized)
+    import json
+    from sqlalchemy import or_
 
-        # 2. proper Capitalization
-        def tr_capitalize(text):
-            words = text.split()
+    # ROBUST VARIANT GENERATION (Ported from movies.py)
+    def generate_search_variants(q):
+        variants = {q, q.lower(), q.upper()}
+        
+        # 1. Turkish Proper Case (i->İ, ı->I at start of words)
+        def tr_title_case(text):
+            words = text.lower().split()
             cap_words = []
             for w in words:
                 if not w: continue
@@ -320,51 +372,85 @@ async def ask_chatbot(
                 else: first = first.upper()
                 cap_words.append(first + rest)
             return " ".join(cap_words)
-
-        titled = tr_capitalize(q) 
+        
+        titled = tr_title_case(q)
         variants.add(titled)
-        variants.add(titled.upper())
-
-        # 3. JSON Escape MANUAL (Robust)
-        # Manually verify encoding for troublesome Turkish chars
-        escape_map = {
-            "ş": "\\u015f", "Ş": "\\u015e",
-            "ı": "\\u0131", "İ": "\\u0130", 
-            "ğ": "\\u011f", "Ğ": "\\u011e",
-            "ü": "\\u00fc", "Ü": "\\u00dc",
-            "ö": "\\u00f6", "Ö": "\\u00d6",
-            "ç": "\\u00e7", "Ç": "\\u00c7"
+        
+        # 2. Anglicized Version (Türkçe karakterleri temizle)
+        tr_map = {
+            "ı": "i", "ğ": "g", "ü": "u", "ş": "s", "ö": "o", "ç": "c",
+            "İ": "I", "Ğ": "G", "Ü": "U", "Ş": "S", "Ö": "O", "Ç": "C"
         }
+        anglicized = "".join(tr_map.get(c, c) for c in q)
+        variants.add(anglicized)
+        variants.add(anglicized.lower())
+        variants.add(anglicized.title())
         
-        def escape_str(s):
-            res = ""
-            for char in s:
-                res += escape_map.get(char, char)
-            return res
+        # 3. Common Turkish character swaps for matching
+        swapped_i = q.replace("i", "İ").replace("I", "ı")
+        variants.add(swapped_i)
+        swapped_i2 = q.replace("İ", "i").replace("ı", "I") 
+        variants.add(swapped_i2)
 
-        variants.add(escape_str(titled))
-        variants.add(escape_str(q))
-        
+        # 4. JSON Escaped Version
         try:
              import json
-             dumped_ascii = json.dumps(titled, ensure_ascii=True)
-             variants.add(dumped_ascii.strip('"'))
+             escaped = json.dumps(q).strip('"')
+             variants.add(escaped)
+             escaped_titled = json.dumps(titled).strip('"')
+             variants.add(escaped_titled)
         except:
              pass
-                 
+        
         return list(variants)
 
-    def search_people(query):
-        if len(query) < 3: return None # Increased min length slightly
+    # 🌟 ICONIC CHARACTERS MAPPING
+    ICONIC_CHARACTERS = {
+        "al pacino": ["Michael Corleone", "Tony Montana"],
+        "marlon brando": ["Vito Corleone"],
+        "robert de niro": ["Travis Bickle", "Vito Corleone"],
+        "christian bale": ["Batman", "Bruce Wayne"],
+        "heath ledger": ["Joker"],
+        "johnny depp": ["Jack Sparrow"],
+        "daniel radcliffe": ["Harry Potter"],
+        "elijah wood": ["Frodo"],
+        "viggo mortensen": ["Aragorn"]
+    }
+
+    def search_people(query, exclude_ids=None):
+        if len(query) < 2: return None
+        
+        print(f"👤 SEARCHING PEOPLE for '{query}'")
         variants = generate_search_variants(query)
+        
+        # EXPAND VARIANTS WITH ICONIC CHARACTERS
+        query_lower_check = query.lower()
+        matched_chars = []
+        for actor, chars in ICONIC_CHARACTERS.items():
+            if actor in query_lower_check: # "al pacino filmleri" contains "al pacino"
+                print(f"🎭 Using Iconic Character Expansion: {actor.title()} -> {chars}")
+                variants.extend(chars)
+                matched_chars.extend(chars)
+        
         filters = []
+        # ATTEMPT 0: Direct Simple Match
+        filters.append(Movie.cast.ilike(f"%{query}%"))
+        filters.append(Movie.directors.ilike(f"%{query}%"))
+        
         for v in variants:
-            # Hem normal hem escaped versiyonu ara
             filters.append(Movie.cast.ilike(f"%{v}%"))
             filters.append(Movie.directors.ilike(f"%{v}%"))
             
-        # Sadece cast/director eşleşmesi
-        res = db.query(Movie).filter(or_(*filters)).order_by(Movie.popularity.desc()).limit(10).all()
+        base_query = db.query(Movie).filter(or_(*filters))
+        
+        if exclude_ids:
+            base_query = base_query.filter(Movie.id.not_in(exclude_ids))
+            
+        res = base_query.order_by(Movie.popularity.desc()).limit(5).all() 
+        
+        # Enrich Result Object for Reply usage? (Can't easily, but we can return matched chars info?)
+        # For now just return movies. The reply builder can't see this.
+        # But we can assume if it worked, results are good.
         return res
 
     def search_title(query):
@@ -373,7 +459,6 @@ async def ask_chatbot(
         filters = []
         for v in variants:
             filters.append(Movie.title.ilike(f"%{v}%"))
-        # Title öncelikli ama popülerlik ile sırala
         res = db.query(Movie).filter(or_(*filters)).order_by(Movie.popularity.desc()).limit(5).all()
         return res
 
@@ -398,7 +483,7 @@ async def ask_chatbot(
     
     if has_theme_keyword:
         print(f"🎬 Theme keyword detected, triggering semantic search: {text}")
-        semantic_results = semantic_search(text, top_k=5, score_threshold=0.35)
+        semantic_results = hybrid_search(text, top_k=5, score_threshold=0.35)
         if semantic_results:
             return {
                 "reply": "Aradığın konuya uygun şunları buldum:",
@@ -429,37 +514,54 @@ async def ask_chatbot(
                     "movies": [{"id": m.id, "title": m.title, "poster": m.poster_url or m.poster_path} for m in overview_results]
                 }
     
-    # 4.1 People Search (Cem Yılmaz vb.) -> High Priority (only if no theme keyword)
-    if len(search_query) > 2 and not has_theme_keyword:
-        # ATTEMPT 1: Raw Search
-        people_res = search_people(search_query)
+    # 4.1 People Search (Cem Yılmaz vb.) -> High Priority
+    # CHECK CONTEXT FOR "BAŞKA" INTENT
+    person_query = search_query 
+    # Logic: If 'search_query' is empty (because 'başka' was stripped) or we explicitly detect 'başka'
+    is_continuation = "başka" in text_lower or "daha" in text_lower
+    
+    last_person_query = context.get("last_person_query")
+    
+    if is_continuation and last_person_query and len(search_query) < 3: 
+         # User said "Başka?" or "Başka var mı"
+         person_query = last_person_query
+         print(f"🔄 Restoring person context: {person_query}")
+
+    if len(person_query) > 2 and not has_theme_keyword:
+        # Session Exclude Logic
+        exclude_ids = set()
+        # Only exclude previous recommendations if user explicitly asks for "MORE" / "OTHER"
+        if session_id and session_id in SESSION_MEMORY and is_continuation:
+             exclude_ids = SESSION_MEMORY[session_id].get("recommended_ids", set())
+
+        # ATTEMPT 0: Direct (raw)
+        people_res = search_people(text_lower if not is_continuation else person_query, exclude_ids)
+        
+        # ATTEMPT 1: Cleaned
+        if not people_res and person_query != text_lower:
+            people_res = search_people(person_query, exclude_ids)
         
         # ATTEMPT 2: Split by Apostrophe
-        if not people_res and "'" in search_query:
-            cleaned = search_query.split("'")[0].strip()
-            people_res = search_people(cleaned)
+        if not people_res and "'" in person_query:
+            cleaned = person_query.split("'")[0].strip()
+            people_res = search_people(cleaned, exclude_ids)
 
         # ATTEMPT 3: Iterative Suffix Stripping
         if not people_res:
-            cleaned = search_query
-            found_suffix = False
+            cleaned = person_query
             for s in suffixes:
                 if cleaned.endswith(s):
                     # Remove suffix
-                    cleaned = cleaned[:-len(s)].strip()
-                    found_suffix = True
-                    # If we stripped something significant, try search again
-                    if len(cleaned) > 2:
-                         people_res = search_people(cleaned)
-                         if people_res: 
-                             search_query = cleaned # Update query for display
-                             break 
-                    break 
+                    candidate = cleaned[:-len(s)].strip()
+                    if len(candidate) > 2:
+                          people_res = search_people(candidate, exclude_ids)
+                          if people_res: 
+                              search_query = candidate # Update query for display
+                              break 
 
         # ATTEMPT 4: Fuzzy Search (TheFuzz)
         if not people_res:
              # Check if we have a close match in POPULAR_PEOPLE
-             # This is expensive if list is huge, but with 1600 movies * 3 actors ~ 4000 names it is OK.
              global POPULAR_PEOPLE
              try:
                  POPULAR_PEOPLE
@@ -467,21 +569,48 @@ async def ask_chatbot(
                  POPULAR_PEOPLE = [] # Should be loaded on startup
              
              if POPULAR_PEOPLE:
-                 match = process.extractOne(search_query, POPULAR_PEOPLE)
+                 match = process.extractOne(text_lower if not is_continuation else person_query, POPULAR_PEOPLE)
                  if match:
                      best_name, score = match
                      if score >= 85: # High confidence for names
-                         print(f"🧶 Fuzzy Person Match: '{search_query}' -> '{best_name}' ({score}%)")
-                         people_res = search_people(best_name)
+                         print(f"🧶 Fuzzy Person Match: '{person_query}' -> '{best_name}' ({score}%)")
+                         people_res = search_people(best_name, exclude_ids)
                          search_query = best_name # Update for display 
 
+        # FINAL CHECK: If continuation but no results found (maybe all exhausted?)
+        if not people_res and is_continuation and last_person_query and exclude_ids:
+             print(f"🔄 All people results shown for {last_person_query}. Resetting...")
+             # Reset session
+             if session_id:
+                 SESSION_MEMORY[session_id]["recommended_ids"] = set()
+             # Retry without exclude
+             people_res = search_people(last_person_query)
+             if people_res:
+                 search_query = last_person_query
+                 # Note: We will add these to session memory below, effectively starting a new cycle
+
         if people_res:
+             # SAVE CONTEXT
+             if session_id:
+                 if session_id not in SESSION_MEMORY: SESSION_MEMORY[session_id] = {"recommended_ids": set()}
+                 if "recommended_ids" not in SESSION_MEMORY[session_id]: SESSION_MEMORY[session_id]["recommended_ids"] = set()
+                 
+                 SESSION_MEMORY[session_id]["last_person_query"] = search_query # Save the effective query name
+                 SESSION_MEMORY[session_id]["last_intent"] = "person"
+                 
+                 current_ids = {m.id for m in people_res}
+                 SESSION_MEMORY[session_id]["recommended_ids"].update(current_ids)
+
              # Use the name that found the result for display if possible, or original query
              name_display = search_query.title()
              if "'" in name_display: name_display = name_display.split("'")[0]
              
+             reply_prefix = f"'{name_display}' (oyuncu/yönetmen) ile ilgili şunları buldum:"
+             if is_continuation and not exclude_ids: # It was a reset
+                  reply_prefix = f"{name_display} için tüm filmleri gösterdim! İşte en iyiler tekrar:"
+             
              return {
-                "reply": f"'{name_display}' (oyuncu/yönetmen) ile ilgili şunları buldum:",
+                "reply": reply_prefix,
                 "movies": [{"id": m.id, "title": m.title, "poster": m.poster_url or m.poster_path} for m in people_res]
             }
 
@@ -521,7 +650,7 @@ async def ask_chatbot(
         
         # Get semantic results based on the FULL query (or title)
         semantic_basis = primary_movie.title if primary_movie else text
-        semantic_results = semantic_search(semantic_basis, top_k=4)
+        semantic_results = hybrid_search(semantic_basis, top_k=4)
         
         # Filter out the primary movie from semantic results to avoid duplication
         if primary_movie and semantic_results:
@@ -546,7 +675,132 @@ async def ask_chatbot(
                 "reply": "Aradığın türde şunları buldum:",
                 "movies": semantic_results
             }
+    # 4.2 PERSONAL RECOMMENDATION CHECK (Priority over Semantic)
+    # Move this BEFORE semantic, because "Bana film öner" matches theme semantics too easily.
+    recommendation_keywords = ["öner", "tavsiye", "ne izle", "zevkim", "benim için", "mood"]
+    if any(k in text_lower for k in recommendation_keywords) and not found_genres and not is_continuation:
+        # Check detected genres: if user said "Komedi öner", then 'found_genres' is set -> Handled by Genre Search (Section 3/2)
+        # But if 'found_genres' is EMPTY, then it's a generic recommendation request.
+        
+        if not current_user:
+            # Login yoksa popüler filmleri verelim
+            popular = db.query(Movie).order_by(Movie.popularity.desc()).limit(5).all()
+            return {
+                "reply": "Sana özel zevkine göre öneri yapabilmem için giriş yapmalısın. Ama şimdilik en popüler şu filmlere göz at:",
+                "movies": [{"id": m.id, "title": m.title, "poster": m.poster_url or m.poster_path} for m in popular]
+            }
+        
+        # Import new recommendation functions
+        from app.services.recommendation import recommend_by_genre, recommend_by_actor
+        
+        # Get session context for rotation
+        rec_context = context.get("recommendation", {})
+        last_rec_type = rec_context.get("last_type", None)
+        previously_recommended = set(rec_context.get("recommended_ids", []))
+        
+        # Rotate recommendation type: None -> genre -> actor -> genre -> ...
+        if last_rec_type == "genre":
+            # This time: Actor-based
+            movies, actors = recommend_by_actor(db, current_user.id, exclude_ids=list(previously_recommended), limit=5)
+            rec_type = "actor"
+            if movies and actors:
+                actor_names = ", ".join(actors[:2])
+                reply = f"🎭 {actor_names} gibi oyuncuların başka filmleri:"
+            else:
+                # Fallback to genre if no actor results
+                movies, genres = recommend_by_genre(db, current_user.id, exclude_ids=list(previously_recommended), limit=5)
+                rec_type = "genre"
+                
+                # Translate genres for display
+                genre_tr_map = {
+                    "Action": "Aksiyon", "Comedy": "Komedi", "Drama": "Dram",
+                    "Science Fiction": "Bilim Kurgu", "Horror": "Korku", "Thriller": "Gerilim",
+                    "Crime": "Suç", "Adventure": "Macera", "Romance": "Romantik",
+                    "Animation": "Animasyon", "Family": "Aile", "War": "Savaş",
+                    "History": "Tarih", "Mystery": "Gizem", "Western": "Western",
+                    "Documentary": "Belgesel", "Music": "Müzik", "Fantasy": "Fantastik"
+                }
+                tr_genres = [genre_tr_map.get(g, g) for g in genres[:2]]
+                genre_names = ", ".join(tr_genres)
+                reply = f"🎬 {genre_names} türünde sana özel seçtiklerim:"
+        else:
+            # Default or last was actor: Genre-based
+            movies, genres = recommend_by_genre(db, current_user.id, exclude_ids=list(previously_recommended), limit=5)
+            rec_type = "genre"
+            
+            # Translate genres for display
+            genre_tr_map = {
+                "Action": "Aksiyon", "Comedy": "Komedi", "Drama": "Dram",
+                "Science Fiction": "Bilim Kurgu", "Horror": "Korku", "Thriller": "Gerilim",
+                "Crime": "Suç", "Adventure": "Macera", "Romance": "Romantik",
+                "Animation": "Animasyon", "Family": "Aile", "War": "Savaş",
+                "History": "Tarih", "Mystery": "Gizem", "Western": "Western",
+                "Documentary": "Belgesel", "Music": "Müzik", "Fantasy": "Fantastik"
+            }
+            
+            if movies and genres:
+                tr_genres = [genre_tr_map.get(g, g) for g in genres[:2]]
+                genre_names = ", ".join(tr_genres)
+                reply = f"🎬 {genre_names} türünde sana özel seçtiklerim:"
+            else:
+                # Fallback to actor if no genre results
+                movies, actors = recommend_by_actor(db, current_user.id, exclude_ids=list(previously_recommended), limit=5)
+                rec_type = "actor"
+                reply = "Beğendiğin filmlerdeki oyuncuların diğer filmleri:"
+        
+        if movies:
+            # Update session memory with recommended IDs
+            new_recommended_ids = list(previously_recommended) + [m.id for m in movies]
+            
+            # Keep only last 50 to avoid memory bloat
+            if len(new_recommended_ids) > 50:
+                new_recommended_ids = new_recommended_ids[-50:]
+            
+            if session_id:
+                SESSION_MEMORY[session_id] = {
+                    **context,
+                    "recommendation": {
+                        "last_type": rec_type,
+                        "recommended_ids": new_recommended_ids
+                    }
+                }
+            
+            return {
+                "reply": reply,
+                "movies": [{"id": m.id, "title": m.title, "poster": m.poster_url or m.poster_path} for m in movies]
+            }
+        
+        # Ultimate fallback: popular movies (Rotated)
+        popular_query = db.query(Movie).filter(~Movie.id.in_(previously_recommended))
+        popular = popular_query.order_by(Movie.popularity.desc()).limit(5).all()
+        
+        if popular:
+             # Update session memory even for popular fallback
+             new_recommended_ids = list(previously_recommended) + [m.id for m in popular]
+             if len(new_recommended_ids) > 50: new_recommended_ids = new_recommended_ids[-50:]
+             
+             if session_id:
+                SESSION_MEMORY[session_id] = {
+                    **context,
+                    "recommendation": {
+                        "last_type": "popular",
+                        "recommended_ids": new_recommended_ids
+                    }
+                }
+             
+             return {
+                "reply": "Özel önerilerim tükendi ama popüler filmlerden devam edelim:",
+                "movies": [{"id": m.id, "title": m.title, "poster": m.poster_url or m.poster_path} for m in popular]
+             }
+        else:
+             # Database exhausted or fully seen
+             return {
+                 "reply": "Veritabanımdaki tüm filmleri dolaştık! Biraz mola verelim mi? 🎬",
+                 "movies": []
+             }
+
     # 4.2.2 THEME/TOPIC-BASED SEMANTIC SEARCH
+
     # Keywords that indicate user wants a thematic search (not just genre or actor)
     theme_keywords = [
         # Emotions
@@ -574,7 +828,7 @@ async def ask_chatbot(
     
     if is_semantic_likely and not found_genres:  # Don't override if genre was detected
         print(f"🧠 Semantic/Theme Search Triggered for: {text}")
-        semantic_results = semantic_search(text, top_k=5, score_threshold=0.4) # Lower threshold for themes
+        semantic_results = hybrid_search(text, top_k=5, score_threshold=0.4) # Lower threshold for themes
         if semantic_results:
              return {
                 "reply": "Aradığın konuya uygun şunları buldum:",
@@ -591,60 +845,104 @@ async def ask_chatbot(
                 "movies": [{"id": m.id, "title": m.title, "poster": m.poster_url or m.poster_path} for m in title_res]
             }
 
-    # 5. PERSONAL RECOMMENDATION
+    # 5. PERSONAL RECOMMENDATION (Rotasyonlu Akıllı Öneri)
     recommendation_keywords = ["öner", "tavsiye", "ne izle", "zevkim", "benim için", "mood"]
     if any(k in text_lower for k in recommendation_keywords):
         if not current_user:
-            # Login yoksa popüler filmleri verelim (Action: none, sadece bilgi ve prompt)
+            # Login yoksa popüler filmleri verelim
             popular = db.query(Movie).order_by(Movie.popularity.desc()).limit(5).all()
             return {
                 "reply": "Sana özel zevkine göre öneri yapabilmem için giriş yapmalısın. Ama şimdilik en popüler şu filmlere göz at:",
                 "movies": [{"id": m.id, "title": m.title, "poster": m.poster_url or m.poster_path} for m in popular]
             }
         
-        # Get user's liked movies
-        from app.models.like import Like
-        user_likes = db.query(Like).filter(Like.user_id == current_user.id).all()
+        # Import new recommendation functions
+        from app.services.recommendation import recommend_by_genre, recommend_by_actor
         
-        if user_likes:
-            liked_movie_ids = [l.movie_id for l in user_likes]
-            liked_movies = db.query(Movie).filter(Movie.id.in_(liked_movie_ids)).all()
+        # Get session context for rotation
+        rec_context = context.get("recommendation", {})
+        last_rec_type = rec_context.get("last_type", None)
+        previously_recommended = set(rec_context.get("recommended_ids", []))
+        
+        # Rotate recommendation type: None -> genre -> actor -> genre -> ...
+        if last_rec_type == "genre":
+            # This time: Actor-based
+            movies, actors = recommend_by_actor(db, current_user.id, exclude_ids=list(previously_recommended), limit=5)
+            rec_type = "actor"
+            if movies and actors:
+                actor_names = ", ".join(actors[:2])
+                reply = f"🎭 {actor_names} gibi oyuncuların başka filmleri:"
+            else:
+                # Fallback to genre if no actor results
+                movies, genres = recommend_by_genre(db, current_user.id, exclude_ids=list(previously_recommended), limit=5)
+                rec_type = "genre"
+                reply = "Beğendiğin türlerde şunları önerebilirim:"
+        else:
+            # Default or last was actor: Genre-based
+            movies, genres = recommend_by_genre(db, current_user.id, exclude_ids=list(previously_recommended), limit=5)
+            rec_type = "genre"
+            if movies and genres:
+                genre_names = ", ".join(genres[:2])
+                reply = f"🎬 {genre_names} türünde sana özel seçtiklerim:"
+            else:
+                # Fallback to actor if no genre results
+                movies, actors = recommend_by_actor(db, current_user.id, exclude_ids=list(previously_recommended), limit=5)
+                rec_type = "actor"
+                reply = "Beğendiğin filmlerdeki oyuncuların diğer filmleri:"
+        
+        if movies:
+            # Update session memory with recommended IDs
+            new_recommended_ids = list(previously_recommended) + [m.id for m in movies]
             
-            # Build a combined profile from liked movies' titles and overviews
-            profile_parts = []
-            for m in liked_movies[:5]:  # Use top 5 recent likes
-                profile_parts.append(m.title)
-                if m.overview_tr:
-                    profile_parts.append(m.overview_tr[:200])  # First 200 chars
-                elif m.overview:
-                    profile_parts.append(m.overview[:200])
+            # Keep only last 50 to avoid memory bloat
+            if len(new_recommended_ids) > 50:
+                new_recommended_ids = new_recommended_ids[-50:]
             
-            combined_profile = ". ".join(profile_parts)
-            print(f"🎯 User profile for recommendation: {combined_profile[:100]}...")
-            
-            # Use semantic search with this combined profile
-            semantic_recs = semantic_search(combined_profile, top_k=10, score_threshold=0.3)
-            
-            # Filter out already liked movies
-            final_recs = [r for r in semantic_recs if r.get("id") not in liked_movie_ids][:5]
-            
-            if final_recs:
-                # Get liked movie titles for response
-                liked_titles = ", ".join([m.title for m in liked_movies[:3]])
-                return {
-                    "reply": f"'{liked_titles}' gibi beğenilerine göre şunları önerebilirim:",
-                    "movies": final_recs
+            if session_id:
+                SESSION_MEMORY[session_id] = {
+                    **context,
+                    "recommendation": {
+                        "last_type": rec_type,
+                        "recommended_ids": new_recommended_ids
+                    }
                 }
-        
-        # Fallback to classic recommendation
-        recs = recommend_personal(db, current_user.id)
-        if not recs:
-            recs = db.query(Movie).order_by(Movie.popularity.desc()).limit(5).all()
             
-        return {
-            "reply": "Senin zevkine göre seçtiklerim:",
-            "movies": [{"id": m.id, "title": m.title, "poster": m.poster_url or m.poster_path} for m in recs]
-        }
+            print(f"🎯 Smart Recommendation: type={rec_type}, count={len(movies)}, excluded={len(previously_recommended)}")
+            
+            return {
+                "reply": reply,
+                "movies": [{"id": m.id, "title": m.title, "poster": m.poster_url or m.poster_path} for m in movies]
+            }
+        
+        # Ultimate fallback: popular movies
+        # Ultimate fallback: popular movies (Rotated)
+        popular_query = db.query(Movie).filter(~Movie.id.in_(previously_recommended))
+        popular = popular_query.order_by(Movie.popularity.desc()).limit(5).all()
+        
+        if popular:
+             # Update session memory even for popular fallback
+             new_recommended_ids = list(previously_recommended) + [m.id for m in popular]
+             if len(new_recommended_ids) > 50: new_recommended_ids = new_recommended_ids[-50:]
+             
+             if session_id:
+                SESSION_MEMORY[session_id] = {
+                    **context,
+                    "recommendation": {
+                        "last_type": "popular",
+                        "recommended_ids": new_recommended_ids
+                    }
+                }
+             
+             return {
+                "reply": "Özel önerilerim tükendi ama popüler filmlerden devam edelim:",
+                "movies": [{"id": m.id, "title": m.title, "poster": m.poster_url or m.poster_path} for m in popular]
+             }
+        else:
+             # Database exhausted or fully seen
+             return {
+                 "reply": "Veritabanımdaki tüm filmleri dolaştık! Biraz mola verelim mi? 🎬",
+                 "movies": []
+             }
 
     # 6. OTHER KEYWORDS
     if "rastgele" in text_lower or "şans" in text_lower:
@@ -658,7 +956,7 @@ async def ask_chatbot(
 
     # 7. GENERIC FALLBACK TO SEMANTIC
     # If nothing else worked, try semantic logic one last time with the raw text
-    fallback_semantic = semantic_search(text, top_k=3)
+    fallback_semantic = hybrid_search(text, top_k=3)
     if fallback_semantic:
          return {
             "reply": "Tam anlayamadım ama belki şunlar ilgini çeker:",
