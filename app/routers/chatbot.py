@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.core.security import get_current_user_optional
 from app.services.nlp_filter import is_clean
-from app.services.recommendation import recommend_personal
+from app.services.recommendation import recommend_personal, recommend_by_genre, recommend_by_actor
 from app.models.movie import Movie
 from sqlalchemy import or_
 from app.services.nlp_service import generate_embeddings_for_db, semantic_search, hybrid_search
@@ -37,6 +37,9 @@ stopwords = {
     "oyuncu", "oyuncusu", "oyuncuları", "oyuncusunun",
     "tüm", "bütün", "hepsi", "hepsini", "tamamı"
 }
+
+# GLOBAL SESSION STORE
+SESSION_MEMORY = {}
 
 def clean_tokens(query):
     # 1. Tokenize
@@ -193,7 +196,24 @@ async def ask_chatbot_impl(
     text = msg.get("message", "").strip()
     if not text:
         return {"reply": "...", "action": "none"}
-    
+
+    # 1. SETUP SESSION
+    session_id = msg.get("session_id")
+    if current_user:
+        session_id = f"user_{current_user.id}"
+        
+    context = SESSION_MEMORY.setdefault(session_id, {}) if session_id else {}
+
+    # 2. AFFIRMATION CHECK (Did user say "Tamam" to a suggestion?)
+    # "tamam", "olur" etc. triggers the pending suggestion if exists
+    affirmation_keywords = ["tamam", "olur", "peki", "evet", "tabii", "öner", "göster", "neden olmasın", "olabilir", "aynen", "tabi"]
+    if text.lower().strip(".,!") in affirmation_keywords:
+        pending = context.get("pending_suggestion")
+        if pending:
+             print(f"✅ Suggestion Accepted: {pending}")
+             text = pending # Transform "tamam" -> "Komedi filmleri"
+             context["pending_suggestion"] = None # Consume it
+
     # EMOJI / SYMBOL CLEANING
     import re
     # Remove emojis and symbols (Except typical punctuation like ?, !, ., ')
@@ -212,6 +232,7 @@ async def ask_chatbot_impl(
     text_lower = text.lower()
 
     if not is_clean(text_lower):
+        context["pending_suggestion"] = "Komedi ve aksiyon filmleri"
         return {
             "reply": "Üslubunuza dikkat etmenizi rica ediyorum 😔. Modunuzu değiştirmek için güzel bir film izlemeye ne dersiniz? Size komedi veya aksiyon önerebilirim 🎬",
             "action": "none"
@@ -234,12 +255,14 @@ async def ask_chatbot_impl(
     # 1.1 Mood Detection
     mood_responses = [
         "iyiyim", "iyiym", "iyi", "süperim", "harikayım", "bomba gibiyim", 
-        "fena değil", "idare eder", "kötüyüm", "modum düşük", "pek iyi değilim", "moralim bozuk"
+        "fena değil", "idare eder", "kötüyüm", "modum düşük", "pek iyi değilim", "moralim bozuk",
+        "hissediyorum", "mutsuzum", "canım sıkkın", "üzgünüm", "keyfim yok"
     ]
 
     # "iyi" gibi kelimeler film aramalarında da geçebileceği için (iyi film öner), arama niyeti yoksa cevapla
     if any(x in text_lower for x in mood_responses) and not any(k in text_lower for k in ["film", "öner", "izle"]):
         if any(neg in text_lower for neg in ["kötü", "değilim", "düşük", "bozuk", "fenayım"]):
+            context["pending_suggestion"] = "Komedi filmleri"
             return {"reply": "Bunu duyduğuma üzüldüm. Belki seni neşelendirecek bir komedi filmi modunu düzeltebilir? 🎬", "action": "none"}
         else:
             return {"reply": "Bunu duyduğuma sevindim! 😊 Sana nasıl bir film önermemi istersin? 🤖", "action": "none"}
@@ -249,6 +272,51 @@ async def ask_chatbot_impl(
 
     if any(x in text_lower for x in ["kimsin", "adın ne", "sen kimsin"]):
         return {"reply": "Ben FilmRec Asistanı. Senin film zevkini çözüp nokta atışı öneriler yapmak için buradayım."}
+
+    # 1.4 LIBRARY BASED RECOMMENDATION (PERSONALIZED) - Genre Only
+    personal_keywords = ["zevkime", "beğendiklerim", "bana özel", "kütüphanem"]
+    if any(k in text_lower for k in personal_keywords):
+        if not current_user:
+             return {"reply": "Kütüphanene göre öneri yapabilmem için giriş yapmalısın. 😉", "action": "login_redirect"}
+        
+        # Genre translation map
+        genre_tr_map = {
+            "Action": "Aksiyon", "Comedy": "Komedi", "Drama": "Dram",
+            "Science Fiction": "Bilim Kurgu", "Horror": "Korku", "Thriller": "Gerilim",
+            "Crime": "Suç", "Adventure": "Macera", "Romance": "Romantik",
+            "Animation": "Animasyon", "Family": "Aile", "War": "Savaş",
+            "History": "Tarih", "Mystery": "Gizem", "Western": "Western",
+            "Documentary": "Belgesel", "Music": "Müzik", "Fantasy": "Fantastik"
+        }
+        
+        # Get previously recommended movies from session
+        lib_context = context.get("library_rec", {})
+        previously_recommended = set(lib_context.get("recommended_ids", []))
+        
+        # Fetch genre-based recommendations (excluding previously shown)
+        movies, top_genres = recommend_by_genre(db, current_user.id, exclude_ids=list(previously_recommended), limit=5)
+        
+        if movies and top_genres:
+            tr_genres = [genre_tr_map.get(g, g) for g in top_genres]
+            reply = f"🎬 Sevdiğin türlere ({', '.join(tr_genres)}) göre bunları seçtim:"
+        elif movies:
+            reply = "🎬 Beğendiğin filmlere göre önerilerim:"
+        else:
+            return {"reply": "Kütüphanen henüz boş veya yeterli veri yok. Biraz film beğenip tekrar gel! ⭐", "action": "none"}
+        
+        # Update session memory with recommended IDs
+        new_recommended_ids = list(previously_recommended) + [m.id for m in movies]
+        if len(new_recommended_ids) > 100:
+            new_recommended_ids = new_recommended_ids[-100:]  # Keep last 100
+        
+        if session_id:
+            context["library_rec"] = {"recommended_ids": new_recommended_ids}
+            SESSION_MEMORY[session_id] = context
+        
+        return {
+            "reply": reply,
+            "movies": [{"id": m.id, "title": m.title, "poster": m.poster_url or m.poster_path} for m in movies]
+        }
 
     # 1.5 UPCOMING / YAKINDA OLANLAR
     # "Yakındaki filmler" butonu veya benzer sorgular için
@@ -290,24 +358,8 @@ async def ask_chatbot_impl(
     new_intent_keywords = ["yeni", "son", "2024", "2025", "güncel", "en yeni", "yakın"]
     is_new_intent = any(k in text_lower for k in new_intent_keywords)
 
-    # SESSION MEMORY STORAGE
-    # Global dict to store context. In a real app, use Redis.
-    # Structure: { session_id: { "last_genre": ("komedi", "Comedy"), "last_actor": "Cem Yılmaz", "last_intent": "genre_search" } }
-    global SESSION_MEMORY
-    try:
-        SESSION_MEMORY
-    except NameError:
-        SESSION_MEMORY = {}
+    # Context is already loaded at start
 
-    session_id = msg.get("session_id")
-    
-    # 🌟 ENHANCEMENT: Use User ID for persistence if logged in
-    # This ensures "Bana Film Öner" rotation works even if frontend refreshes session_id
-    if current_user:
-        session_id = f"user_{current_user.id}"
-        print(f"🔐 Authenticated User detected. Using ID-based session: {session_id}")
-
-    context = SESSION_MEMORY.get(session_id, {}) if session_id else {}
 
     # Keywords for "Refinement / Continuation"
     refinement_keywords = ["daha", "başka", "yenileri", "eskileri", "peki", "ya", "değil"]
@@ -616,7 +668,11 @@ async def ask_chatbot_impl(
                  "action": "none"
              }
 
-    if len(person_query) > 2 and not has_theme_keyword:
+
+    # Allow people search if: query is long enough AND (no theme keyword OR it's a continuation with context)
+    should_search_people = len(person_query) > 2 and (not has_theme_keyword or (is_continuation and last_person_query))
+    
+    if should_search_people:
         # Session Exclude Logic
         exclude_ids = set()
         # Only exclude previous recommendations if user explicitly asks for "MORE" / "OTHER"
@@ -797,8 +853,7 @@ async def ask_chatbot_impl(
                 "movies": [{"id": m.id, "title": m.title, "poster": m.poster_url or m.poster_path} for m in popular]
             }
         
-        # Import new recommendation functions
-        from app.services.recommendation import recommend_by_genre, recommend_by_actor
+
         
         # Get session context for rotation
         rec_context = context.get("recommendation", {})
@@ -974,8 +1029,7 @@ async def ask_chatbot_impl(
                 "movies": [{"id": m.id, "title": m.title, "poster": m.poster_url or m.poster_path} for m in popular]
             }
         
-        # Import new recommendation functions
-        from app.services.recommendation import recommend_by_genre, recommend_by_actor
+
         
         # Get session context for rotation
         rec_context = context.get("recommendation", {})

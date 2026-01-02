@@ -66,6 +66,7 @@ export default function Chatbot() {
 
     // Example Commands
     const suggestions = [
+        "Beğendiklerime Göre Öner ❤️",
         "Bana film öner 🎲",
         "Aksiyon filmi öner 💥",
         "Brad Pitt filmleri 🎬",
