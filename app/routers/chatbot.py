@@ -17,6 +17,142 @@ router = APIRouter(prefix="/chatbot", tags=["Chatbot"])
 # Added personalized recommendations from liked movies.
 
 # 🔥 STARTUP: Embeddings Yükle
+
+# ⚡ GLOBAL NLP HELPERS
+
+from app.models.movie import Movie
+from sqlalchemy import or_
+
+# ⚡ GLOBAL NLP HELPERS
+suffixes = ["nın", "nin", "nun", "nün", "den", "dan", "ten", "tan"]
+
+stopwords = {
+    "filmleri", "filmi", "oynadığı", "yönettiği", "yönetmen", "kimdir", "öner", "bana", "hakkında", "izle",
+    "var", "mi", "mı", "mu", "mü", "film", "benzer", "tarzı", "gibi", "ile", "ve", "veya", "olan", "yapan", "listele", "göster", "getir", "bul",
+    "filmii", "flimi", "fılm", "fılmı", "oner", "hngi", "yapım", 
+    "hani", "şöyle", "böyle", "işte", "falan", "filan", "yani", "acaba", "şey", "diyorlar",
+    "farklı", "değişik", "başka", "daha",
+    "filim", "filimler", "filimlerini", "filimlerin", "filmlerini", "filmlerin",
+    "yönetmeni", "yonetmen", "yonetmeni", "yönetmeninin",
+    "oyuncu", "oyuncusu", "oyuncuları", "oyuncusunun",
+    "tüm", "bütün", "hepsi", "hepsini", "tamamı"
+}
+
+def clean_tokens(query):
+    # 1. Tokenize
+    tokens = query.split()
+    cleaned_tokens = []
+    for t in tokens:
+        # 3. Stopword removal
+        if t in stopwords: continue
+        
+        # 4. Suffix stripping (basic for Turkish names handling)
+        # "tarantino'nun" -> "tarantino"
+        candidate = t
+        for s in suffixes:
+            if t.endswith(s) and len(t) > len(s) + 2: 
+                candidate = t[:-len(s)]
+                break
+        
+        cleaned_tokens.append(candidate)
+        
+    return " ".join(cleaned_tokens).strip()
+
+# ROBUST VARIANT GENERATION (Ported from movies.py)
+def generate_search_variants(q):
+    variants = {q, q.lower(), q.upper()}
+    
+    # 1. Turkish Proper Case (i->İ, ı->I at start of words)
+    def tr_title_case(text):
+        words = text.lower().split()
+        cap_words = []
+        for w in words:
+            if not w: continue
+            first = w[0]
+            rest = w[1:]
+            if first == "i": first = "İ"
+            elif first == "ı": first = "I"
+            else: first = first.upper()
+            cap_words.append(first + rest)
+        return " ".join(cap_words)
+    
+    titled = tr_title_case(q)
+    variants.add(titled)
+    
+    # 2. Anglicized Version (Türkçe karakterleri temizle)
+    tr_map = {
+        "ı": "i", "ğ": "g", "ü": "u", "ş": "s", "ö": "o", "ç": "c",
+        "İ": "I", "Ğ": "G", "Ü": "U", "Ş": "S", "Ö": "O", "Ç": "C"
+    }
+    anglicized = "".join(tr_map.get(c, c) for c in q)
+    variants.add(anglicized)
+    variants.add(anglicized.lower())
+    variants.add(anglicized.title())
+    
+    # 3. Common Turkish character swaps for matching
+    swapped_i = q.replace("i", "İ").replace("I", "ı")
+    variants.add(swapped_i)
+    swapped_i2 = q.replace("İ", "i").replace("ı", "I") 
+    variants.add(swapped_i2)
+
+    # 4. JSON Escaped Version
+    try:
+            import json
+            escaped = json.dumps(q).strip('"')
+            variants.add(escaped)
+            escaped_titled = json.dumps(titled).strip('"')
+            variants.add(escaped_titled)
+    except:
+            pass
+    
+    return list(variants)
+
+# 🌟 ICONIC CHARACTERS MAPPING
+ICONIC_CHARACTERS = {
+    "al pacino": ["Michael Corleone", "Tony Montana"],
+    "marlon brando": ["Vito Corleone"],
+    "robert de niro": ["Travis Bickle", "Vito Corleone"],
+    "christian bale": ["Batman", "Bruce Wayne"],
+    "heath ledger": ["Joker"],
+    "johnny depp": ["Jack Sparrow"],
+    "daniel radcliffe": ["Harry Potter"],
+    "elijah wood": ["Frodo"],
+    "viggo mortensen": ["Aragorn"]
+}
+
+
+def search_people(query, db, exclude_ids=None):
+    if len(query) < 2: return None
+    
+    variants = generate_search_variants(query)
+    
+    # EXPAND VARIANTS WITH ICONIC CHARACTERS
+    query_lower_check = query.lower()
+    matched_chars = []
+    for actor, chars in ICONIC_CHARACTERS.items():
+        if actor in query_lower_check: 
+            variants.extend(chars)
+            matched_chars.extend(chars)
+    
+    filters = []
+    # ATTEMPT 0: Direct Simple Match
+    filters.append(Movie.cast.ilike(f"%{query}%"))
+    filters.append(Movie.directors.ilike(f"%{query}%"))
+    
+    for v in variants:
+        filters.append(Movie.cast.ilike(f"%{v}%"))
+        filters.append(Movie.directors.ilike(f"%{v}%"))
+        
+    base_query = db.query(Movie).filter(or_(*filters))
+    
+    if exclude_ids:
+        ex_list = list(exclude_ids)
+        # SQLAlchemy not_in prefers list
+        base_query = base_query.filter(Movie.id.not_in(ex_list))
+        
+    res = base_query.order_by(Movie.popularity.desc()).limit(5).all() 
+    return res
+
 @router.on_event("startup")
 def load_embeddings():
     db = SessionLocal()
@@ -32,6 +168,7 @@ def load_embeddings():
     
     print(f"🧶 Fuzzy Search için {len(POPULAR_PEOPLE)} kişi hafızaya alındı (Cache).")
     
+    
     db.close()
 
 @router.post("/ask")
@@ -40,9 +177,29 @@ async def ask_chatbot(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user_optional)
 ):
+    try:
+        return await ask_chatbot_impl(msg, db, current_user)
+    except Exception as e:
+        import traceback
+        trace = traceback.format_exc()
+        print(f"Server Error: {trace}")
+        return {"reply": f"Internal Error Log: {trace}", "action": "none"}
+
+async def ask_chatbot_impl(
+    msg: dict,
+    db: Session,
+    current_user
+):
     text = msg.get("message", "").strip()
     if not text:
         return {"reply": "...", "action": "none"}
+    
+    # EMOJI / SYMBOL CLEANING
+    import re
+    # Remove emojis and symbols (Except typical punctuation like ?, !, ., ')
+    # Keeping alphanumeric and basic punctuation
+    # This regex removes characters that are NOT: word characters, whitespace, or standard punctuation
+    text = re.sub(r'[^\w\s,.?!\'\"]', '', text).strip()
     
     # 0. GİRDİ UZUNLUĞU VE ANLAMSIZLIK KONTROLÜ
     if len(text) < 3:
@@ -56,7 +213,7 @@ async def ask_chatbot(
 
     if not is_clean(text_lower):
         return {
-            "reply": "Lütfen saygılı bir dil kullanalım. Size nasıl yardımcı olabilirim?",
+            "reply": "Üslubunuza dikkat etmenizi rica ediyorum 😔. Modunuzu değiştirmek için güzel bir film izlemeye ne dersiniz? Size komedi veya aksiyon önerebilirim 🎬",
             "action": "none"
         }
 
@@ -74,8 +231,18 @@ async def ask_chatbot(
     if any(x in text_lower for x in ["nasılsın", "nasıl gidiyor", "ne haber"]):
         return {"reply": "Harikayım! Film izlemek (daha doğrusu önermek) beni mutlu ediyor. Sen nasılsın?"}
     
-    if any(x in text_lower for x in ["ben de iyiyim", "ben iyiyim", "bende iyiyim"]):
-        return {"reply": "Sana ne önermemi istersin? 🤖"}
+    # 1.1 Mood Detection
+    mood_responses = [
+        "iyiyim", "iyiym", "iyi", "süperim", "harikayım", "bomba gibiyim", 
+        "fena değil", "idare eder", "kötüyüm", "modum düşük", "pek iyi değilim", "moralim bozuk"
+    ]
+
+    # "iyi" gibi kelimeler film aramalarında da geçebileceği için (iyi film öner), arama niyeti yoksa cevapla
+    if any(x in text_lower for x in mood_responses) and not any(k in text_lower for k in ["film", "öner", "izle"]):
+        if any(neg in text_lower for neg in ["kötü", "değilim", "düşük", "bozuk", "fenayım"]):
+            return {"reply": "Bunu duyduğuma üzüldüm. Belki seni neşelendirecek bir komedi filmi modunu düzeltebilir? 🎬", "action": "none"}
+        else:
+            return {"reply": "Bunu duyduğuma sevindim! 😊 Sana nasıl bir film önermemi istersin? 🤖", "action": "none"}
 
     if any(x in text_lower for x in ["teşekkür", "tesekkür", "sağol", "eyvallah"]):
         return {"reply": "Rica ederim! İyi seyirler 🍿"}
@@ -244,9 +411,12 @@ async def ask_chatbot(
         # Check noise...
         turkish_keywords = ["türk", "yerli", "türkçe"]
         is_turkish_intent = any(k in text_lower for k in turkish_keywords)
+
+        foreign_keywords = ["yabancı"]
+        is_foreign_intent = any(k in text_lower for k in foreign_keywords)
         
         noise = ["filmleri", "filmi", "film", "öner", "listele", "aç", "getir", "var", "mı", "boşluk", "bana", "ve", "ile", "daha", "yenileri", "olan"] 
-        all_noise = noise + new_intent_keywords + negative_keywords + turkish_keywords # Add keywords to noise
+        all_noise = noise + new_intent_keywords + negative_keywords + turkish_keywords + foreign_keywords # Add keywords to noise
         
         clean_t = text_lower
         for k, v in found_genres: clean_t = clean_t.replace(k, "")
@@ -277,9 +447,11 @@ async def ask_chatbot(
         # 2. QUERY
         query_base = db.query(Movie)
         
-        # Turkish Filter
+        # Language Filter
         if is_turkish_intent:
             query_base = query_base.filter(Movie.original_language == 'tr')
+        elif is_foreign_intent:
+            query_base = query_base.filter(Movie.original_language != 'tr')
         
         # Positive Filters
         for g_val in unique_genre_values:
@@ -330,40 +502,6 @@ async def ask_chatbot(
         }
 
     # 3. YARDIMCI FONKSİYONLAR VE ARAMA HAZIRLIĞI
-    stopwords = {
-        "filmleri", "filmi", "oynadığı", "yönettiği", "yönetmen", "kimdir", "öner", "bana", "hakkında", "izle", 
-        "var", "mi", "mı", "mu", "mü", "film", "benzer", "tarzı", "gibi", "ile", "ve", "veya", "olan", "yapan", "listele", "göster", "getir", "bul",
-        "filmii", "flimi", "fılm", "fılmı", "oner", "hngi", "yapım" # Common typos
-    }
-    
-    suffixes = [
-        "'tan", "'ten", "'dan", "'den", "'nın", "'nin", "'nun", "'nün",
-        "'lar", "'ler", "'ta", "'te", "'da", "'de", "'ın", "'in", "'un", "'ün", "'a", "'e", "'",
-        "tan", "ten", "dan", "den", "nın", "nin", "nun", "nün",
-        "lar", "ler", "ta", "te", "da", "de", "ın", "in", "un", "ün", "a", "e"
-    ]
-
-    def clean_tokens(query):
-        # 1. Tokenize
-        tokens = query.split()
-        cleaned_tokens = []
-        for t in tokens:
-            # 3. Stopword removal
-            if t in stopwords: continue
-            
-            # 4. Suffix stripping (basic for Turkish names handling)
-            # "tarantino'nun" -> "tarantino"
-            suffixes = ["nın", "nin", "nun", "nün", "in", "ın", "un", "ün", "yi", "yı", "yu", "yü", "ye", "ya", "den", "dan", "ten", "tan"]
-            candidate = t
-            for s in suffixes:
-                if t.endswith(s) and len(t) > len(s) + 2: 
-                    candidate = t[:-len(s)]
-                    break
-            
-            cleaned_tokens.append(candidate)
-            
-        return " ".join(cleaned_tokens).strip()
-
     search_query = clean_tokens(text_lower)
     print(f"🕵️ CHATBOT DEBUG: text_lower='{text_lower}' -> clean_tokens='{search_query}'")
     
@@ -373,103 +511,7 @@ async def ask_chatbot(
     import json
     from sqlalchemy import or_
 
-    # ROBUST VARIANT GENERATION (Ported from movies.py)
-    def generate_search_variants(q):
-        variants = {q, q.lower(), q.upper()}
-        
-        # 1. Turkish Proper Case (i->İ, ı->I at start of words)
-        def tr_title_case(text):
-            words = text.lower().split()
-            cap_words = []
-            for w in words:
-                if not w: continue
-                first = w[0]
-                rest = w[1:]
-                if first == "i": first = "İ"
-                elif first == "ı": first = "I"
-                else: first = first.upper()
-                cap_words.append(first + rest)
-            return " ".join(cap_words)
-        
-        titled = tr_title_case(q)
-        variants.add(titled)
-        
-        # 2. Anglicized Version (Türkçe karakterleri temizle)
-        tr_map = {
-            "ı": "i", "ğ": "g", "ü": "u", "ş": "s", "ö": "o", "ç": "c",
-            "İ": "I", "Ğ": "G", "Ü": "U", "Ş": "S", "Ö": "O", "Ç": "C"
-        }
-        anglicized = "".join(tr_map.get(c, c) for c in q)
-        variants.add(anglicized)
-        variants.add(anglicized.lower())
-        variants.add(anglicized.title())
-        
-        # 3. Common Turkish character swaps for matching
-        swapped_i = q.replace("i", "İ").replace("I", "ı")
-        variants.add(swapped_i)
-        swapped_i2 = q.replace("İ", "i").replace("ı", "I") 
-        variants.add(swapped_i2)
 
-        # 4. JSON Escaped Version
-        try:
-             import json
-             escaped = json.dumps(q).strip('"')
-             variants.add(escaped)
-             escaped_titled = json.dumps(titled).strip('"')
-             variants.add(escaped_titled)
-        except:
-             pass
-        
-        return list(variants)
-
-    # 🌟 ICONIC CHARACTERS MAPPING
-    ICONIC_CHARACTERS = {
-        "al pacino": ["Michael Corleone", "Tony Montana"],
-        "marlon brando": ["Vito Corleone"],
-        "robert de niro": ["Travis Bickle", "Vito Corleone"],
-        "christian bale": ["Batman", "Bruce Wayne"],
-        "heath ledger": ["Joker"],
-        "johnny depp": ["Jack Sparrow"],
-        "daniel radcliffe": ["Harry Potter"],
-        "elijah wood": ["Frodo"],
-        "viggo mortensen": ["Aragorn"]
-    }
-
-    def search_people(query, exclude_ids=None):
-        if len(query) < 2: return None
-        
-        print(f"👤 SEARCHING PEOPLE for '{query}'")
-        variants = generate_search_variants(query)
-        
-        # EXPAND VARIANTS WITH ICONIC CHARACTERS
-        query_lower_check = query.lower()
-        matched_chars = []
-        for actor, chars in ICONIC_CHARACTERS.items():
-            if actor in query_lower_check: # "al pacino filmleri" contains "al pacino"
-                print(f"🎭 Using Iconic Character Expansion: {actor.title()} -> {chars}")
-                variants.extend(chars)
-                matched_chars.extend(chars)
-        
-        filters = []
-        # ATTEMPT 0: Direct Simple Match
-        filters.append(Movie.cast.ilike(f"%{query}%"))
-        filters.append(Movie.directors.ilike(f"%{query}%"))
-        
-        for v in variants:
-            filters.append(Movie.cast.ilike(f"%{v}%"))
-            filters.append(Movie.directors.ilike(f"%{v}%"))
-            
-        base_query = db.query(Movie).filter(or_(*filters))
-        
-        if exclude_ids:
-            base_query = base_query.filter(Movie.id.not_in(exclude_ids))
-            
-        res = base_query.order_by(Movie.popularity.desc()).limit(5).all() 
-        
-        # Enrich Result Object for Reply usage? (Can't easily, but we can return matched chars info?)
-        # For now just return movies. The reply builder can't see this.
-        # But we can assume if it worked, results are good.
-        return res
 
     def search_title(query):
         if len(query) < 2: return None
@@ -497,7 +539,15 @@ async def ask_chatbot(
         "korkunç", "ürkütücü", "gerilimli"
     ]
     
-    has_theme_keyword = any(kw in text_lower for kw in theme_keywords)
+    # REGEX Word Boundary Check for Theme Keywords
+    # Prevents "başka" detecting "aşk"
+    has_theme_keyword = False
+    for kw in theme_keywords:
+        # Regex: Lookbehind for non-word, match kw, Lookahead for non-word
+        pattern = r"(?<!\w)" + re.escape(kw) + r"(?!\w)"
+        if re.search(pattern, text_lower):
+            has_theme_keyword = True
+            break
     
     if has_theme_keyword:
         print(f"🎬 Theme keyword detected, triggering semantic search: {text}")
@@ -535,15 +585,36 @@ async def ask_chatbot(
     # 4.1 People Search (Cem Yılmaz vb.) -> High Priority
     # CHECK CONTEXT FOR "BAŞKA" INTENT
     person_query = search_query 
-    # Logic: If 'search_query' is empty (because 'başka' was stripped) or we explicitly detect 'başka'
-    is_continuation = "başka" in text_lower or "daha" in text_lower
+    
+    continuation_keywords = ["başka", "daha", "farklı", "yenileri", "peki", "sıradaki", "devam", "değişik"]
+    is_continuation = any(k in text_lower for k in continuation_keywords)
     
     last_person_query = context.get("last_person_query")
     
-    if is_continuation and last_person_query and len(search_query) < 3: 
-         # User said "Başka?" or "Başka var mı"
-         person_query = last_person_query
-         print(f"🔄 Restoring person context: {person_query}")
+    if is_continuation and last_person_query:
+         # Remove continuation keywords to see if there is a NEW intent content
+         temp_clean = text_lower
+         for ck in continuation_keywords:
+             temp_clean = temp_clean.replace(ck, "")
+         
+         # If remaining content is short (mostly punctuation or stop words), restore context
+         # E.g. "Peki başka?" -> " ?" -> short
+         if len(temp_clean.strip()) < 5: 
+             person_query = last_person_query
+             search_query = person_query # Update display name to the person, not "Peki başka"
+             print(f"🔄 Bağlam Korundu ({text}): {person_query} için yeni sonuçlar aranıyor...")
+    
+    # NEW: Handle continuation without context (User says "farklı" but no previous search)
+    elif is_continuation and not last_person_query:
+         temp_clean = text_lower
+         for ck in continuation_keywords:
+             temp_clean = temp_clean.replace(ck, "")
+         
+         if len(temp_clean.strip()) < 4:
+             return {
+                 "reply": "Henüz bir arama yapmadın. Önce bir oyuncu, yönetmen veya film türü söylemelisin. 😉",
+                 "action": "none"
+             }
 
     if len(person_query) > 2 and not has_theme_keyword:
         # Session Exclude Logic
@@ -561,16 +632,16 @@ async def ask_chatbot(
              people_res = [] # Skip search
         else:
              # ATTEMPT 0: Direct (raw)
-             people_res = search_people(text_lower if not is_continuation else person_query, exclude_ids)
+             people_res = search_people(text_lower if not is_continuation else person_query, db, exclude_ids)
              
              # ATTEMPT 1: Cleaned
              if not people_res and person_query != text_lower:
-                 people_res = search_people(person_query, exclude_ids)
+                 people_res = search_people(person_query, db, exclude_ids)
                  
              # ATTEMPT 2: Split by Apostrophe
              if not people_res and "'" in person_query:
                  cleaned = person_query.split("'")[0].strip()
-                 people_res = search_people(cleaned, exclude_ids)
+                 people_res = search_people(cleaned, db, exclude_ids)
     
              # ATTEMPT 3: Iterative Suffix Stripping
              if not people_res:
@@ -582,7 +653,7 @@ async def ask_chatbot(
                          # Check negative intent on candidate too?
                          if len(candidate) > 2:
                                if not analyze_person_intent(text_lower, candidate):
-                                   people_res = search_people(candidate, exclude_ids)
+                                   people_res = search_people(candidate, db, exclude_ids)
                                    if people_res: 
                                        search_query = candidate 
                                        break
@@ -608,20 +679,17 @@ async def ask_chatbot(
                              print(f"🚫 Negative Person Intent on Fuzzy Match: {best_name}")
                          else:
                              print(f"🧶 Fuzzy Person Match: '{person_query}' -> '{best_name}' ({score}%)")
-                             people_res = search_people(best_name, exclude_ids)
+                             people_res = search_people(best_name, db, exclude_ids)
                              search_query = best_name # Update for display 
 
         # FINAL CHECK: If continuation but no results found (maybe all exhausted?)
         if not people_res and is_continuation and last_person_query and exclude_ids:
-             print(f"🔄 All people results shown for {last_person_query}. Resetting...")
-             # Reset session
-             if session_id:
-                 SESSION_MEMORY[session_id]["recommended_ids"] = set()
-             # Retry without exclude
-             people_res = search_people(last_person_query)
-             if people_res:
-                 search_query = last_person_query
-                 # Note: We will add these to session memory below, effectively starting a new cycle
+             # NO RESET! Just inform user.
+             name_display = last_person_query.title()
+             return {
+                "reply": f"{name_display} için veritabanımızda başka film kalmadı! Önerilerim bu kadar.",
+                "movies": [] # Empty list
+             }
 
         if people_res:
              # SAVE CONTEXT
@@ -629,6 +697,11 @@ async def ask_chatbot(
                  if session_id not in SESSION_MEMORY: SESSION_MEMORY[session_id] = {"recommended_ids": set()}
                  if "recommended_ids" not in SESSION_MEMORY[session_id]: SESSION_MEMORY[session_id]["recommended_ids"] = set()
                  
+                 # RESET LOGIC: If this is a FRESH search (not continuation), clear previous history
+                 if not is_continuation:
+                     SESSION_MEMORY[session_id]["recommended_ids"] = set()
+                     print(f"🧹 Session history cleared for new search: {search_query}")
+
                  SESSION_MEMORY[session_id]["last_person_query"] = search_query # Save the effective query name
                  SESSION_MEMORY[session_id]["last_intent"] = "person"
                  
@@ -640,8 +713,8 @@ async def ask_chatbot(
              if "'" in name_display: name_display = name_display.split("'")[0]
              
              reply_prefix = f"'{name_display}' (oyuncu/yönetmen) ile ilgili şunları buldum:"
-             if is_continuation and not exclude_ids: # It was a reset
-                  reply_prefix = f"{name_display} için tüm filmleri gösterdim! İşte en iyiler tekrar:"
+             if is_continuation: 
+                  reply_prefix = f"{name_display} için diğer önerilerim:"  # Cleaner continuation message
              
              return {
                 "reply": reply_prefix,
