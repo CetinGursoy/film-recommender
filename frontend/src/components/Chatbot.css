@@ -65,12 +65,32 @@
     font-size: 1rem;
 }
 
+
+.header-actions {
+    display: flex;
+    gap: 15px;
+    align-items: center;
+}
+
 .chat-header button {
     background: none;
     border: none;
     color: white;
     font-size: 1.5rem;
     cursor: pointer;
+    padding: 0;
+    line-height: 1;
+    transition: transform 0.2s, opacity 0.2s;
+    opacity: 0.8;
+}
+
+.chat-header button:hover {
+    transform: scale(1.1);
+    opacity: 1;
+}
+
+.reset-btn {
+    font-size: 1.2rem !important; /* Biraz daha küçük olsun */
 }
 
 .chat-messages {

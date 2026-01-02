@@ -101,6 +101,20 @@ export default function Chatbot() {
             })
             .finally(() => setLoading(false));
     };
+    const handleReset = () => {
+        // 1. Reset messages
+        setMessages([
+            { sender: 'bot', text: 'Merhaba! Ben FilmRec asistanı. Sana ne önermemi istersin? 🤖' }
+        ]);
+
+        // 2. Clear Session ID and generate new one
+        const newSid = Math.random().toString(36).substring(2) + Date.now().toString(36);
+        localStorage.setItem("chat_session_id", newSid);
+        setSessionId(newSid);
+
+        // 3. Clear loading
+        setLoading(false);
+    };
 
     return (
         <div className="chatbot-wrapper">
@@ -116,7 +130,10 @@ export default function Chatbot() {
                 <div className="chat-window">
                     <div className="chat-header">
                         <h3>FilmRec Asistan</h3>
-                        <button onClick={() => setIsOpen(false)}>×</button>
+                        <div className="header-actions">
+                            <button className="reset-btn" onClick={handleReset} title="Sohbeti Sıfırla">🔄</button>
+                            <button onClick={() => setIsOpen(false)}>×</button>
+                        </div>
                     </div>
 
                     <div className="chat-messages">

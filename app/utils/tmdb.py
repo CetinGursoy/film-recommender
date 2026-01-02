@@ -60,3 +60,39 @@ def get_movie_stats(tmdb_id: int):
         "vote_count": res.get("vote_count"),
         "vote_average": res.get("vote_average"),
     }
+
+
+# ======================================================
+# ⭐ Poster Bulma (Yedek)
+# ======================================================
+def get_poster_url(title: str):
+    """Film başlığına göre poster URL bulur. (V3 API Key kullanır)"""
+    if not TMDB_API_KEY:
+        print("❌ TMDB_API_KEY bulunamadı!")
+        return None
+
+    url = "https://api.themoviedb.org/3/search/movie"
+    
+    params = {
+        "query": title, 
+        "language": "en-US",
+        "api_key": TMDB_API_KEY 
+    }
+
+    try:
+        r = requests.get(url, params=params)
+        r.raise_for_status()
+
+        data = r.json().get("results", [])
+        if not data:
+            return None
+
+        poster_path = data[0].get("poster_path")
+        
+        if poster_path:
+            return f"https://image.tmdb.org/t/p/w500{poster_path}" 
+        
+    except Exception as e:
+        print(f"❌ Poster API hatası: {e}")
+
+    return None
