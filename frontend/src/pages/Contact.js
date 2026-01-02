@@ -93,7 +93,7 @@ export default function Contact() {
           <div className="captcha-container" style={{ display: 'flex', justifyContent: 'center', margin: '20px 0' }}>
             <ReCAPTCHA
               ref={recaptchaRef}
-              sitekey="6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI" // TEST KEY - REPLACE IN PRODUCTION
+              sitekey="6LelRj4sAAAAAL1SLCpFFE_AF-VQFKsi_L38i-JK"
               onChange={handleCaptchaChange}
             />
           </div>

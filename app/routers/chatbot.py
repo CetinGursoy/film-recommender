@@ -41,6 +41,63 @@ stopwords = {
 # GLOBAL SESSION STORE
 SESSION_MEMORY = {}
 
+# 🎭 NICKNAME / ALIAS MAP for common Turkish celebrities
+# Maps common misspellings, nicknames, abbreviations to correct names
+CELEBRITY_ALIASES = {
+    # Cem Yılmaz variants
+    "cm yılmaz": "Cem Yılmaz",
+    "cem yılmz": "Cem Yılmaz",
+    "cemyılmaz": "Cem Yılmaz",
+    "cem yilmaz": "Cem Yılmaz",
+    "cm yilmaz": "Cem Yılmaz",
+    "cmylmz": "Cem Yılmaz",
+    
+    # Şahan Gökbakar variants
+    "şahan": "Şahan Gökbakar",
+    "sahan": "Şahan Gökbakar",
+    "gökbakar": "Şahan Gökbakar",
+    "sahan gokbakar": "Şahan Gökbakar",
+    "recep ivedik": "Şahan Gökbakar",
+    
+    # Kenan İmirzalıoğlu
+    "kenan": "Kenan İmirzalıoğlu",
+    "imirzalıoğlu": "Kenan İmirzalıoğlu",
+    "kenan imirzalioglu": "Kenan İmirzalıoğlu",
+    
+    # Ata Demirer
+    "ata": "Ata Demirer",
+    "demirer": "Ata Demirer",
+    
+    # Yılmaz Erdoğan
+    "yılmaz erdoğan": "Yılmaz Erdoğan",
+    "yilmaz erdogan": "Yılmaz Erdoğan",
+    
+    # Directors
+    "tarantino": "Quentin Tarantino",
+    "nolan": "Christopher Nolan",
+    "scorsese": "Martin Scorsese",
+    "spielberg": "Steven Spielberg",
+    "kubrick": "Stanley Kubrick",
+    "hitchcock": "Alfred Hitchcock",
+    "fincher": "David Fincher",
+    "villeneuve": "Denis Villeneuve",
+    
+    # Famous actors
+    "dicaprio": "Leonardo DiCaprio",
+    "leo": "Leonardo DiCaprio",
+    "deniro": "Robert De Niro",
+    "de niro": "Robert De Niro",
+    "pacino": "Al Pacino",
+    "brad pitt": "Brad Pitt",
+    "pitt": "Brad Pitt",
+    "tom hanks": "Tom Hanks",
+    "hanks": "Tom Hanks",
+    "morgan freeman": "Morgan Freeman",
+    "freeman": "Morgan Freeman",
+    "keanu": "Keanu Reeves",
+    "keanu reeves": "Keanu Reeves",
+}
+
 def clean_tokens(query):
     # 1. Tokenize
     tokens = query.split()
@@ -344,6 +401,91 @@ async def ask_chatbot_impl(
                 "reply": "Şu an için veritabanımda yakın tarihli bir film görünmüyor."
             }
 
+    # 1.5 "BEĞENDİKLERİME GÖRE ÖNER" - Genre-based from Liked Movies
+    liked_based_keywords = ["beğendiklerime", "sevdiklerime", "beğenilerime", "liked", "favorilerime"]
+    if any(k in text_lower for k in liked_based_keywords):
+        print(f"❤️ Beğendiklerime Göre Öner tetiklendi: {text}")
+        
+        # 1. LOGIN CHECK
+        if not current_user:
+            popular = db.query(Movie).order_by(Movie.popularity.desc()).limit(5).all()
+            return {
+                "reply": "Beğenilerine göre öneri yapabilmem için giriş yapmalısın! 🔐 Şimdilik en popüler filmlere göz at:",
+                "movies": [{"id": m.id, "title": m.title, "poster": m.poster_url or m.poster_path} for m in popular]
+            }
+        
+        # 2. GET PREVIOUSLY RECOMMENDED IDS (to avoid repeats)
+        liked_context = context.get("liked_recommendation", {})
+        previously_recommended = set(liked_context.get("recommended_ids", []))
+        
+        print(f"📊 Liked Context: excluded={len(previously_recommended)}")
+        
+        # 3. GET TOP 2 GENRES FROM LIKED MOVIES
+        # Use recommend_by_genre which already does this analysis
+        movies, top_genres = recommend_by_genre(db, current_user.id, exclude_ids=list(previously_recommended), limit=5)
+        
+        # 4. TRANSLATE GENRES TO TURKISH
+        genre_tr_map = {
+            "Action": "Aksiyon", "Comedy": "Komedi", "Drama": "Dram",
+            "Science Fiction": "Bilim Kurgu", "Horror": "Korku", "Thriller": "Gerilim",
+            "Crime": "Suç", "Adventure": "Macera", "Romance": "Romantik",
+            "Animation": "Animasyon", "Family": "Aile", "War": "Savaş",
+            "History": "Tarih", "Mystery": "Gizem", "Western": "Western",
+            "Documentary": "Belgesel", "Music": "Müzik", "Fantasy": "Fantastik"
+        }
+        
+        if movies and top_genres:
+            # Show only top 2 genres
+            tr_genres = [genre_tr_map.get(g, g) for g in top_genres[:2]]
+            genre_names = ", ".join(tr_genres)
+            
+            # Update session memory with recommended IDs
+            new_recommended_ids = list(previously_recommended) + [m.id for m in movies]
+            
+            # Keep only last 50 to avoid memory bloat
+            if len(new_recommended_ids) > 50:
+                new_recommended_ids = new_recommended_ids[-50:]
+            
+            if session_id:
+                if session_id not in SESSION_MEMORY:
+                    SESSION_MEMORY[session_id] = {}
+                SESSION_MEMORY[session_id]["liked_recommendation"] = {
+                    "recommended_ids": new_recommended_ids
+                }
+            
+            print(f"🎯 Liked Recommendation: genres={top_genres[:2]}, count={len(movies)}, total_excluded={len(new_recommended_ids)}")
+            
+            return {
+                "reply": f"🎬 {genre_names} türünde sana özel seçtiklerim:",
+                "movies": [{"id": m.id, "title": m.title, "poster": m.poster_url or m.poster_path} for m in movies]
+            }
+        
+        # 5. FALLBACK: No liked movies or genres exhausted -> Popular movies
+        popular_query = db.query(Movie).filter(~Movie.id.in_(previously_recommended))
+        popular = popular_query.order_by(Movie.popularity.desc()).limit(5).all()
+        
+        if popular:
+            new_recommended_ids = list(previously_recommended) + [m.id for m in popular]
+            if len(new_recommended_ids) > 50:
+                new_recommended_ids = new_recommended_ids[-50:]
+            
+            if session_id:
+                if session_id not in SESSION_MEMORY:
+                    SESSION_MEMORY[session_id] = {}
+                SESSION_MEMORY[session_id]["liked_recommendation"] = {
+                    "recommended_ids": new_recommended_ids
+                }
+            
+            return {
+                "reply": "Beğenilerine göre önerilerim tükendi! 🎬 Popüler filmlerden devam edelim:",
+                "movies": [{"id": m.id, "title": m.title, "poster": m.poster_url or m.poster_path} for m in popular]
+            }
+        else:
+            return {
+                "reply": "Tüm filmleri önerdim! 🎉 Biraz mola verelim mi?",
+                "movies": []
+            }
+
     # 2. GENRE DETECTION (En yüksek öncelik - "Komedi filmi aç" deyince komedi gelmeli)
     genres_map = {
         "aksiyon": "Action", "komedi": "Comedy", "dram": "Drama",
@@ -444,7 +586,17 @@ async def ask_chatbot_impl(
                      found_genres.add((best_match, genres_map[best_match]))
 
     # If no genres found BUT we have context... (Keep existing logic)
-    if not found_genres and not excluded_genres and context.get("last_genres") and (is_refinement or len(text.split()) < 4):
+    # IMPORTANT: Don't restore genre if last intent was "person" (actor/director search)
+    last_intent = context.get("last_intent")
+    should_restore_genre = (
+        not found_genres and 
+        not excluded_genres and 
+        context.get("last_genres") and 
+        (is_refinement or len(text.split()) < 4) and
+        last_intent != "person"  # Don't restore genre after a person search!
+    )
+    
+    if should_restore_genre:
          # Restore last genres
          found_genres = set(tuple(x) for x in context['last_genres'])
 
@@ -687,8 +839,19 @@ async def ask_chatbot_impl(
              print(f"🚫 Negative Person Intent Detected: {person_query}. Skipping People Search.")
              people_res = [] # Skip search
         else:
+             # ATTEMPT -1: CELEBRITY ALIAS LOOKUP (Highest priority!)
+             alias_match = CELEBRITY_ALIASES.get(text_lower) or CELEBRITY_ALIASES.get(person_query)
+             if alias_match:
+                 print(f"🎭 Alias Match Found: '{text_lower}' -> '{alias_match}'")
+                 people_res = search_people(alias_match, db, exclude_ids)
+                 if people_res:
+                     search_query = alias_match  # Update for display
+             else:
+                 people_res = []
+             
              # ATTEMPT 0: Direct (raw)
-             people_res = search_people(text_lower if not is_continuation else person_query, db, exclude_ids)
+             if not people_res:
+                 people_res = search_people(text_lower if not is_continuation else person_query, db, exclude_ids)
              
              # ATTEMPT 1: Cleaned
              if not people_res and person_query != text_lower:
@@ -725,11 +888,16 @@ async def ask_chatbot_impl(
              except NameError:
                  POPULAR_PEOPLE = [] # Should be loaded on startup
              
-             if POPULAR_PEOPLE:
-                 match = process.extractOne(text_lower if not is_continuation else person_query, POPULAR_PEOPLE)
+             # Convert to list if it's a set (for fuzzy matching compatibility)
+             people_list = list(POPULAR_PEOPLE) if POPULAR_PEOPLE else []
+             print(f"🔍 DEBUG Fuzzy: Query='{text_lower}', POPULAR_PEOPLE count={len(people_list)}")
+             
+             if people_list:
+                 match = process.extractOne(text_lower if not is_continuation else person_query, people_list)
+                 print(f"🔍 DEBUG Fuzzy Match Result: {match}")
                  if match:
                      best_name, score = match
-                     if score >= 85: # High confidence for names
+                     if score >= 70: # Increased tolerance for typos (e.g., "cm yılmaz" -> "Cem Yılmaz")
                          # Check negation for fuzzy match name
                          if analyze_person_intent(text_lower, best_name) or analyze_person_intent(text_lower, person_query):
                              print(f"🚫 Negative Person Intent on Fuzzy Match: {best_name}")

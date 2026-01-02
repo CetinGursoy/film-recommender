@@ -103,9 +103,9 @@ def recommend_by_genre(db: Session, user_id: int, exclude_ids: list = None, limi
     if not genre_counts:
         return [], []
     
-    # En popüler 3 tür (Kullanıcı isteği: Top 3)
+    # En popüler 2 tür (Top 2 genres from liked movies)
     sorted_genres = sorted(genre_counts.items(), key=lambda x: x[1], reverse=True)
-    top_genres = [g[0] for g in sorted_genres[:3]]
+    top_genres = [g[0] for g in sorted_genres[:2]]
     
     # 3. Bu türlerdeki filmleri bul (beğenilmemiş ve exclude edilmemiş)
     all_exclude = liked_movie_ids.union(set(exclude_ids))
@@ -114,12 +114,39 @@ def recommend_by_genre(db: Session, user_id: int, exclude_ids: list = None, limi
     from sqlalchemy import or_
     genre_filters = [Movie.genres.like(f"%{g}%") for g in top_genres]
     
-    recommended = (db.query(Movie)
+    # Get more candidates for hybrid scoring
+    candidates = (db.query(Movie)
                    .filter(or_(*genre_filters))
                    .filter(~Movie.id.in_(all_exclude))
-                   .order_by(Movie.popularity.desc())
-                   .limit(limit)
+                   .filter(Movie.vote_average >= 4.0)  # Minimum 4.0 puan filtresi
+                   .limit(50)  # Get more for scoring
                    .all())
+    
+    if not candidates:
+        # Fallback: puanı 6'dan düşük olanları da dahil et
+        candidates = (db.query(Movie)
+                       .filter(or_(*genre_filters))
+                       .filter(~Movie.id.in_(all_exclude))
+                       .limit(50)
+                       .all())
+    
+    # 4. HYBRID SCORING: vote_average (60%) + popularity (40%)
+    import math
+    
+    def hybrid_score(movie):
+        vote = movie.vote_average or 0
+        pop = movie.popularity or 0
+        
+        # Normalize popularity (log scale to reduce extreme values)
+        pop_normalized = min(math.log10(pop + 1) / 3, 1) if pop > 0 else 0
+        
+        # Combined score: 60% rating, 40% popularity
+        return (vote / 10) * 0.6 + pop_normalized * 0.4
+    
+    # Sort by hybrid score
+    candidates.sort(key=hybrid_score, reverse=True)
+    
+    recommended = candidates[:limit]
     
     return recommended, top_genres
 
@@ -166,12 +193,32 @@ def recommend_by_actor(db: Session, user_id: int, exclude_ids: list = None, limi
     from sqlalchemy import or_
     actor_filters = [Movie.cast.like(f"%{a}%") for a in top_actors]
     
-    recommended = (db.query(Movie)
+    # Get more candidates for hybrid scoring
+    candidates = (db.query(Movie)
                    .filter(or_(*actor_filters))
                    .filter(~Movie.id.in_(all_exclude))
-                   .order_by(Movie.popularity.desc())
-                   .limit(limit)
+                   .filter(Movie.vote_average >= 4.0)  # Minimum 4.0 puan filtresi
+                   .limit(50)
                    .all())
+    
+    if not candidates:
+        candidates = (db.query(Movie)
+                       .filter(or_(*actor_filters))
+                       .filter(~Movie.id.in_(all_exclude))
+                       .limit(50)
+                       .all())
+    
+    # HYBRID SCORING: vote_average (60%) + popularity (40%)
+    import math
+    
+    def hybrid_score(movie):
+        vote = movie.vote_average or 0
+        pop = movie.popularity or 0
+        pop_normalized = min(math.log10(pop + 1) / 3, 1) if pop > 0 else 0
+        return (vote / 10) * 0.6 + pop_normalized * 0.4
+    
+    candidates.sort(key=hybrid_score, reverse=True)
+    recommended = candidates[:limit]
     
     return recommended, top_actors
 

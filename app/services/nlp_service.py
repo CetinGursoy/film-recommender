@@ -28,7 +28,7 @@ def generate_embeddings_for_db(movies):
     Veritabanındaki filmlerin özetlerini (overview_tr veya overview) vektöre çevirir.
     Cache mekanizması eklendi: Pickle dosyasından okur, yoksa oluşturup kaydeder.
     """
-    global _movie_embeddings, _movie_metadata, _model
+    global _movie_embeddings, _movie_metadata, _model, _popular_people
     
     # 1. Try Loading from Cache
     if os.path.exists(EMBEDDING_FILE):

@@ -13,7 +13,7 @@ from datetime import datetime
 router = APIRouter(prefix="/contact", tags=["Contact"])
 
 
-RECAPTCHA_SECRET_KEY = "6LeIxAcTAAAAAGG-vFI1TnRWxMZNFuojJ4WifJWe"
+RECAPTCHA_SECRET_KEY = "6LelRj4sAAAAAKSnJoY4ulMdO-KOpIT-Nr253EqO"
 
 # -- ADMIN ENDPOINTS --
 
