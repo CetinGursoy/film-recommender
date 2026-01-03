@@ -5,6 +5,7 @@ import {
   BarChart, Bar, Legend
 } from 'recharts';
 import { apiFetch } from "../api";
+import ActiveUsers from "../components/admin/ActiveUsers";
 import "./AdminDashboard.css";
 
 export default function AdminDashboard() {
@@ -203,11 +204,34 @@ export default function AdminDashboard() {
                 <h3>Toplam Yorum</h3>
                 <p>{stats.total_reviews}</p>
               </div>
+              <div className="stat-card">
+                <h3>Sistem Durumu</h3>
+                {analytics?.system_health ? (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginTop: '10px' }}>
+                    <span style={{
+                      display: 'block',
+                      width: '12px', height: '12px',
+                      borderRadius: '50%',
+                      backgroundColor: analytics.system_health.color,
+                      boxShadow: `0 0 10px ${analytics.system_health.color}`
+                    }}></span>
+                    <span style={{ fontSize: '1.2em', fontWeight: 'bold' }}>{analytics.system_health.latency} ms</span>
+                  </div>
+                ) : (
+                  <p style={{ fontSize: '0.9em', color: '#888' }}>Ölçülüyor...</p>
+                )}
+              </div>
             </div>
 
             {/* 🔥 GRAPHS SECTION (Real Data) */}
             {analytics && (
               <div className="charts-section">
+                {/* ACTIVE USERS LEADERBOARD */}
+                {/* We place it here or below charts. Maybe side by side with charts or a full row. 
+                    Let's place it at the top of charts or as a full width block after charts. 
+                    Actually, the user asked for it. Let's put it as a separate block below the main stats cards. 
+                */}
+
                 {/* WEEKLY ACTIVITY */}
                 <div className="chart-box">
                   <h3>Haftalık Aktivite</h3>
@@ -243,6 +267,7 @@ export default function AdminDashboard() {
                 </div>
               </div>
             )}
+
 
             {/* TOP COMMENTED MOVIES TABLE */}
             {analytics?.top_commented_movies && (
@@ -337,6 +362,9 @@ export default function AdminDashboard() {
                 </table>
               </div>
             )}
+
+            {/* ACTIVE USERS LEADERBOARD */}
+            {analytics?.active_users && <ActiveUsers users={analytics.active_users} />}
           </div>
         )}
 

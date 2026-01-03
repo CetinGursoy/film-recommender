@@ -26,7 +26,17 @@ export default function Navbar() {
         <Link to="/watchlist">Kütüphanem</Link>
         <Link to="/about">Hakkımızda</Link>
         <Link to="/contact">İletişim</Link>
+
         <Link to="/did-you-know">Keşif Odası</Link>
+        <Link to="/quiz" style={{
+          color: '#00e5ff',
+          border: '1px solid #00e5ff',
+          borderRadius: '20px',
+          padding: '5px 15px',
+          marginLeft: '10px',
+          fontWeight: 'bold',
+          textDecoration: 'none'
+        }}>🖥️ QuizShow</Link>
       </div>
 
       {/* LOGIN / USER */}

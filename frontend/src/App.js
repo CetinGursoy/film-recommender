@@ -20,7 +20,9 @@ import WatchList from "./pages/watchlist";
 import AdminRoute from "./components/AdminRoute";
 import Chatbot from "./components/Chatbot";
 import PersonSearch from "./pages/PersonSearch";
+
 import DidYouKnow from "./pages/DidYouKnow"; // 🔥 Import
+import QuizShow from "./pages/QuizShow";
 
 function App() {
   return (
@@ -66,6 +68,7 @@ function App() {
         <Route path="/about" element={<About />} />
         <Route path="/contact" element={<Contact />} />
         <Route path="/did-you-know" element={<DidYouKnow />} />
+        <Route path="/quiz" element={<QuizShow />} />
 
         {/* Auth */}
         <Route path="/login" element={<Login />} />

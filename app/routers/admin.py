@@ -167,8 +167,64 @@ def get_analytics(db: Session = Depends(get_db), admin: User = Depends(get_curre
         "top_commented_movies": [{"id": m.id, "title": m.title, "review_count": count} for m, count in top_commented],
         "top_liked_movies": [{"id": m.id, "title": m.title, "like_count": count} for m, count in top_liked],
         "top_rated_movies": [{"id": m.id, "title": m.title, "avg_score": round(avg, 1), "count": count} for m, avg, count in top_rated],
-        "genre_distribution": genre_data[:10] # Top 10 genres
+        "genre_distribution": genre_data[:10], # Top 10 genres
+        "active_users": get_active_users_stats(db),
+        "system_health": get_system_health(db)
     }
+
+def get_system_health(db: Session):
+    import time
+    from sqlalchemy import text
+    start_time = time.time()
+    try:
+        db.execute(text("SELECT 1"))
+        latency = (time.time() - start_time) * 1000 # ms
+        return {
+            "status": "Online",
+            "latency": round(latency, 2),
+            "color": "#4caf50" # Green
+        }
+    except Exception as e:
+        print(f"Health Check Error: {e}")
+        return {
+            "status": "Offline",
+            "latency": 0,
+            "color": "#f44336" # Red
+        }
+
+
+def get_active_users_stats(db: Session):
+    # Review counts
+    review_counts = db.query(Review.user_id, func.count(Review.id)).group_by(Review.user_id).all()
+    review_map = {user_id: count for user_id, count in review_counts}
+
+    # Like counts
+    like_counts = db.query(Like.user_id, func.count(Like.id)).group_by(Like.user_id).all()
+    like_map = {user_id: count for user_id, count in like_counts}
+
+    # Users
+    users = db.query(User).all()
+    
+    active_users_list = []
+    for user in users:
+        r_count = review_map.get(user.id, 0)
+        l_count = like_map.get(user.id, 0)
+        total_score = r_count + l_count
+        
+        if total_score > 0:
+            active_users_list.append({
+                "id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "review_count": r_count,
+                "like_count": l_count,
+                "total_score": total_score
+            })
+            
+    # Sort by total score
+    active_users_list.sort(key=lambda x: x['total_score'], reverse=True)
+    
+    return active_users_list[:10]
 
 
 @router.post("/movies")
