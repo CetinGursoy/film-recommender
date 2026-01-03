@@ -10,7 +10,6 @@ export default function QuizShow() {
     const [score, setScore] = useState(0);
     const [showScore, setShowScore] = useState(false);
     const [selectedOption, setSelectedOption] = useState(null);
-    const [isCorrect, setIsCorrect] = useState(null);
 
     const startGame = (selectedCategory) => {
         const allQuestions = [...quizQuestions[selectedCategory]];
@@ -23,7 +22,6 @@ export default function QuizShow() {
         setScore(0);
         setShowScore(false);
         setSelectedOption(null);
-        setIsCorrect(null);
     };
 
     const handleOptionClick = (option) => {
@@ -33,7 +31,6 @@ export default function QuizShow() {
         const correct = option === currentQ.correctAns;
 
         setSelectedOption(option);
-        setIsCorrect(correct);
 
         if (correct) {
             setScore(score + 1);
@@ -44,7 +41,6 @@ export default function QuizShow() {
             if (nextQuestion < questions.length) {
                 setCurrentQuestionIndex(nextQuestion);
                 setSelectedOption(null);
-                setIsCorrect(null);
             } else {
                 setShowScore(true);
             }
