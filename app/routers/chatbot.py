@@ -10,6 +10,7 @@ from sqlalchemy import or_
 from app.services.nlp_service import generate_embeddings_for_db, semantic_search, hybrid_search
 from app.db import SessionLocal
 from thefuzz import process
+import random
 
 router = APIRouter(prefix="/chatbot", tags=["Chatbot"])
 
@@ -677,7 +678,13 @@ async def ask_chatbot_impl(
              joined_names = " - ".join(display_genre_names) if display_genre_names else "Genel"
              reply_msg = f"İşte senin için en yeni {joined_names} filmleri"
         else:
-             movies = query_base.order_by(Movie.vote_average.desc()).limit(5).all()
+             # RANDOMIZED SELECTION from Top 50 (High Rated)
+             candidates = query_base.order_by(Movie.vote_average.desc()).limit(50).all()
+             if candidates:
+                 movies = random.sample(candidates, min(len(candidates), 5))
+             else:
+                 movies = []
+             
              joined_names = " - ".join(display_genre_names) if display_genre_names else "Önerilen"
              
              if not movies and session_id:
